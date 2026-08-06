@@ -1,21 +1,30 @@
-# Build the recipe image and push it to ghcr.io.
+# Build the recipe image, gate it, and push it to ghcr.io.
 #
-# RUNNER REQUIREMENT: the image is ~46 GB uncompressed (~15 GB pushed), so
-# GitHub-hosted runners (~14 GB free disk) CANNOT build it. Point this at a
-# self-hosted runner with ~100 GB free disk and Docker. No GPU is needed to
-# build — only to serve. The `runner` input selects the runs-on label
-# (default: self-hosted).
+# Runs on the org's GitHub-hosted larger runner `ubuntu-8core-300gb`
+# (8-core / 32 GB / 300 GB SSD — the image is ~46 GB uncompressed, far past
+# the standard hosted runners' disk). Larger runners bill per job-minute
+# only; the runner definition costs nothing idle. No GPU is needed to
+# build — only to serve.
+#
+# Deliberately NOT triggered on pull_request: CI checks run against
+# repository code with a packages-write token, and this repo is public.
+# Push to main (or a v* tag, or manual dispatch) is the trust boundary.
 name: build-image
 
 on:
   workflow_dispatch:
     inputs:
-      runner:
-        description: "runs-on label of the build machine (needs ~100 GB free disk)"
-        default: self-hosted
-        required: false
+      push_image:
+        description: "push the built image to ghcr.io (false = build-only dry run)"
+        type: boolean
+        default: true
   push:
+    branches: [main]
     tags: ["v*"]
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -23,23 +32,48 @@ permissions:
 
 jobs:
   build-push:
-    runs-on: ${{ inputs.runner || 'self-hosted' }}
+    runs-on: ubuntu-8core-300gb
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
 
+      # ---- gates before the expensive build ----------------------------
+      - name: Validate compose file
+        run: |
+          python3 -c "import yaml,sys; yaml.safe_load(open('docker-compose.example.yml'))"
+          echo "compose YAML OK"
+
+      - name: Patches apply on a pristine tree (dry run)
+        run: |
+          git clone --depth 1 --branch v0.5.16 https://github.com/sgl-project/sglang /tmp/sglang-check
+          cd /tmp/sglang-check
+          for p in "$GITHUB_WORKSPACE"/patches/*.diff; do
+            git apply --check "$p" && git apply "$p" || { echo "FAILED: $p"; exit 1; }
+          done
+          echo "all patches apply"
+
+      # ---- build (the Dockerfile re-applies patches and runs the -------
+      # ---- in-image ast-parse gate over every patched file) ------------
+      - name: Build
+        run: docker build -t "$IMAGE:sha-${GITHUB_SHA::7}" .
+
+      - name: In-image import smoke
+        run: |
+          docker run --rm --entrypoint python3 "$IMAGE:sha-${GITHUB_SHA::7}" \
+            -c "import sglang; print('sglang import OK', sglang.__version__)"
+
+      # ---- push ---------------------------------------------------------
       - name: Log in to ghcr.io
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build
-        run: docker build -t "$IMAGE:sha-${GITHUB_SHA::7}" .
-
       - name: Tag and push (sha + date + latest)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
         run: |
           DATE=$(date -u +%Y-%m-%d)
           docker tag "$IMAGE:sha-${GITHUB_SHA::7}" "$IMAGE:$DATE"
@@ -47,3 +81,10 @@ jobs:
           docker push "$IMAGE:sha-${GITHUB_SHA::7}"
           docker push "$IMAGE:$DATE"
           docker push "$IMAGE:latest"
+
+      - name: Emit digest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+        run: |
+          docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:latest" | tee digest.txt
+          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
+          cat digest.txt >> "$GITHUB_STEP_SUMMARY"
