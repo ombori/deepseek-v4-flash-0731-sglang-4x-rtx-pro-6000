@@ -17,6 +17,15 @@ Existing public recipes for this model target 2× GPU / TP=2 (see
 [Related work](#related-work)). This one is the 4× / TP=4 / DP-attention
 shape.
 
+**The built image is published and public** — no build step needed:
+
+```sh
+docker pull ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest
+```
+
+See [Run the prebuilt image](#run-the-prebuilt-image) for the full command,
+including the checkpoint mount.
+
 ## Run the prebuilt image
 
 The image built from this repo is published to GitHub Container Registry.
@@ -128,7 +137,12 @@ docker compose -f docker-compose.example.yml up -d
 
 `sglang.bench_serving`, random 1024-in / 512-out, measured **2026-08-05 on
 the exact image + compose in this repo** (only `--speculative-*` flags
-removed for the no-spec column). Numbers are output tok/s.
+removed for the no-spec column). Numbers are output tok/s. The
+[concurrency sweep](#concurrency-and-operating-points) below is a separate
+later run of the same config, so its absolute figures differ by a few
+percent from this table (run-to-run variance on a thermally-soaked box);
+use the sweep for scaling shape and this table for the spec-vs-no-spec
+comparison.
 
 | workload | no spec | DSPARK γ=4 | Δ |
 |---|---|---|---|
