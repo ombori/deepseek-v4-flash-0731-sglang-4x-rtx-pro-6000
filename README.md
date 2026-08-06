@@ -8,6 +8,22 @@ Everything was measured on exactly this rig, but parts of it travel further than
 
 The existing public recipes for this model target 2× GPU / TP=2 (see [Related work](#related-work)). This one is the 4× / TP=4 / DP-attention shape.
 
+## 2026-08-06 update: faster prefill
+
+The patch set now carries two additions past the published image: a backport of open PR [#29927](https://github.com/sgl-project/sglang/pull/29927) (the SM120 prefill stack) and a completion patch that puts the #32183 backport on the code path v0.5.16 actually executes. Together with an sgl-deep-gemm bump in the Dockerfile (0.1.4.post1 → 0.1.5.post1, the version #29927 was developed against) and three env vars in the compose file, single-request prefill improves 19–25% at 256–512K contexts and TTFT drops 16–20%. Decode is unchanged (bs=1 within 4%, conc64 +2%).
+
+| context, single request | published image | this repo |
+|---|---|---|
+| 64K | 10.7 s TTFT / 5,747 tok/s | 9.7 s / 6,287 |
+| 256K | 61.1 s / 4,234 | 48.8 s / 5,283 |
+| 512K | 143.7 s / 3,626 | 120.5 s / 4,315 |
+
+The updated stack passed the same ship gate as the published image: 5 cold launches under the bursty repro protocol below, 0 corruption events across 11,187 requests, 8/8 streaming truncation probes complete.
+
+The prebuilt image tags do not include any of this yet; they refresh with the next pushed build. Until then, build from this repo — the compose file already assumes the new build, and the three new env vars abort at boot on the published `:latest` (its older DeepGEMM asserts on SM120), so don't retag the pulled image onto the updated compose.
+
+One thing the DeepGEMM bump does not unlock: its FP4 grouped MoE GEMM still fails on SM120 inside DeepGEMM's own warmup (CUDA 719 at DSv4 per-rank shapes), so the MoE runner stays `flashinfer_mxfp4` and the remaining piece of #29927's recipe waits on a DeepGEMM fix.
+
 ## Run the prebuilt image
 
 The image is public, so there's no build step:
@@ -200,11 +216,13 @@ All patches apply to `lmsysorg/sglang:v0.5.16-cu130-runtime`. `prNNNNN-notest.di
 | `pr33098-notest.diff` | [#33098](https://github.com/sgl-project/sglang/pull/33098) MERGED | DSpark draft ForwardBatch misses `original_global_num_tokens_cpu` + non-padded token counts under `--enable-dp-attention` → scheduler crash on first request. **Mandatory for DP+DSPARK** |
 | `pr32467-notest.diff` | [#32467](https://github.com/sgl-project/sglang/pull/32467) OPEN | missing `__syncthreads()` race in `plan_compress_prefill_kernel0` → ragged extend misdetected as MTP-uniform → `ragged_id` overrun → illegal memory access at decode-graph capture (shape-dependent) |
 | `pr32183-notest.diff` | [#32183](https://github.com/sgl-project/sglang/pull/32183) OPEN | DSpark verifier compressed-KV rewrite window capped at 4 draft tokens regardless of verify width → stale state in verify rows. Necessary but **not sufficient** for issue 1 (see above) |
+| `pr32183-hipradix-completion.diff` | ours — v0.5.16-specific, no upstream counterpart | upstream #32183 threads `verify_width` only through `deepseek_v4_backend.py`, but the live raw-verify path on v0.5.16 is the hip_radix backend variant, where it still defaulted to 0 and the write plan kept dropping verifier rows at depth ≥ 4. Without this the row above never executes on the serving path |
 | `pr33531-notest.diff` | [#33531](https://github.com/sgl-project/sglang/pull/33531) OPEN | verify path reads a renamed-away attr → ALL sampling penalties silently dead under spec decode on stock v0.5.16. Restores the additive ones (frequency/presence/min_new_tokens); hunks re-derived for v0.5.16. The multiplicative gap remains (known issue 4) |
 | `pr32277-notest.diff` | [#32277](https://github.com/sgl-project/sglang/pull/32277) MERGED | clamps all-sentinel DSpark draft rows to token 0 in `_online_combine_kernel` (they otherwise emit an out-of-range token id into verify), plus NaN guards in the reject-sampling path. Measured **not** to fix known issue 1, kept as correctness hardening |
 | `pr31017-notest.diff` | [#31017](https://github.com/sgl-project/sglang/pull/31017) MERGED | MoE top-k renormalization epsilon for degenerate rows |
+| `pr29927-notest.diff` | [#29927](https://github.com/sgl-project/sglang/pull/29927) OPEN | the SM120 prefill stack: batched sparse-MLA prefill for >64-row calls, chunked indexer metadata, u64-lane page-split, HC-prenorm dispatch, and the env switches the compose file enables (which also need the Dockerfile's sgl-deep-gemm bump). This backport gates the >64-row route on `topk == 512`: ungated, DSPARK's draft indexer (topk=192) lands in the prefill kernel and crash-loops the boot — upstream can't see this because `main` can't boot DSPARK on SM120 without #33407. Details in the diff header |
 
-This patch set is exactly the image the numbers above were measured on. Retire each backport when it lands in an sglang release. The stack also rebases cleanly onto upstream `main` (three of the diffs drop as merged, the flashinfer pin becomes upstream's own), but note that `main` does not fix known issue 1.
+The two patches from the 2026-08-06 update are ahead of the published image tags; everything else is exactly the image the numbers above were measured on. Retire each backport when it lands in an sglang release. The stack also rebases cleanly onto upstream `main` (three of the diffs drop as merged, the flashinfer pin becomes upstream's own), but note that `main` does not fix known issue 1.
 
 ## What here generalizes
 
