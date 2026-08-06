@@ -1,56 +1,31 @@
 # DeepSeek-V4-Flash-0731 on 4× RTX PRO 6000 Blackwell (SM120) — SGLang recipe
 
-Reproducible SGLang serving recipe for
-[DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
-(284B MoE / 13B active, native FP4+FP8 checkpoint, 1M context) on **four**
-RTX PRO 6000 Blackwell GPUs: TP4 / DP4 (attention) / EP4 (MoE), DSPARK
-speculative decoding at draft depth 4, fp8 KV cache.
+This is the config we run in production: [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) (284B MoE / 13B active, native FP4+FP8, 1M context) on four RTX PRO 6000 Blackwell cards. TP4, DP4 attention, EP4, DSPARK speculative decoding at draft depth 4, fp8 KV cache.
 
-Stock sglang v0.5.16 (the latest release as of 2026-08-05) cannot serve this
-config: DSPARK crash-loops at warmup on SM120, several DSPARK-verify and
-tool-call-streaming bugs bite in production, and the checkpoint-default
-speculative draft depth **silently corrupts output** (details below — this
-also affects upstream `main`). This repo carries the patch set, the image
-build, the serving config, measured numbers, and the failure boundaries.
+Stock sglang v0.5.16 can't serve this. DSPARK crash-loops at warmup on SM120, several verify and tool-call-streaming bugs bite under real traffic, and the checkpoint's default speculative draft depth silently corrupts output (that last one also affects upstream `main`, details below). This repo has the patch set, the image build, the serving config, the measured numbers, and the failure boundaries we mapped so you don't have to.
 
-Existing public recipes for this model target 2× GPU / TP=2 (see
-[Related work](#related-work)). This one is the 4× / TP=4 / DP-attention
-shape.
+Everything was measured on exactly this rig, but parts of it travel further than the name suggests: the patches apply to any SM120 card count, the draft-depth corruption affects any DSpark deployment on any engine, and the dependency pins hold for Blackwell workstation cards generally. See [What here generalizes](#what-here-generalizes).
 
-**The built image is published and public** — no build step needed:
-
-```sh
-docker pull ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest
-```
-
-See [Run the prebuilt image](#run-the-prebuilt-image) for the full command,
-including the checkpoint mount.
+The existing public recipes for this model target 2× GPU / TP=2 (see [Related work](#related-work)). This one is the 4× / TP=4 / DP-attention shape.
 
 ## Run the prebuilt image
 
-The image built from this repo is published to GitHub Container Registry.
-It is the exact build the numbers under
-[Measured performance](#measured-performance) were measured on. `:latest`
-tracks `main`; date tags (e.g. `:2026-08-06`) pin a specific build.
+The image is public, so there's no build step:
 
 ```sh
 docker pull ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest
 ```
 
-The model weights are **not** in the image. Download the ~158 GB
-DeepSeek-V4-Flash-0731 checkpoint separately and mount it read-only; the
-commands below assume it sits at `/models/DeepSeek-V4-Flash-0731` on the
-host:
+`:latest` tracks `main`; date tags (e.g. `:2026-08-06`) pin a specific build. It's the exact build the numbers under [Measured performance](#measured-performance) came from.
+
+The weights are not in the image. Download the ~158 GB checkpoint and mount it read-only; the commands below assume `/models/DeepSeek-V4-Flash-0731` on the host:
 
 ```sh
 hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
     --local-dir /models/DeepSeek-V4-Flash-0731
 ```
 
-Minimal `docker run` with the validated serving shape (TP4/DP4/EP4, DSPARK
-γ=4, fp8 KV, indexer threshold). The flags mirror
-[`docker-compose.example.yml`](./docker-compose.example.yml) — that file is
-canonical if the two ever differ, and it documents *why* each flag is set:
+Minimal `docker run` with the validated shape. The flags mirror [`docker-compose.example.yml`](./docker-compose.example.yml); that file is canonical if the two ever differ, and it documents why each flag is set:
 
 ```sh
 docker run -d --name sglang \
@@ -85,9 +60,7 @@ docker run -d --name sglang \
   --enable-cache-report
 ```
 
-For anything long-lived, prefer the compose file (adds healthcheck, restart
-policy, and the JIT-cache persistence notes). It references the local build
-tag, so retag the pulled image first:
+For anything long-lived, use the compose file instead (healthcheck, restart policy, JIT-cache persistence notes). It references the local build tag, so retag the pulled image first:
 
 ```sh
 docker tag ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest \
@@ -95,34 +68,24 @@ docker tag ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest \
 docker compose -f docker-compose.example.yml up -d
 ```
 
-First boot is slow (JIT kernel compile + flashinfer autotune, ~10–15 min);
-the compose healthcheck allows for it. The OpenAI-compatible API lands on
-`:8000`.
+First boot takes 10–15 minutes (JIT kernel compile plus flashinfer autotune); the compose healthcheck allows for it. The OpenAI-compatible API lands on `:8000`.
 
-Clients should send `temperature 1.0 / top_p 1.0` (DeepSeek's official
-calibration for this checkpoint — lower temperatures drive repetition
-loops).
+Send `temperature 1.0 / top_p 1.0` from clients. That's DeepSeek's calibration for this checkpoint; lower temperatures drive repetition loops.
 
 ## Hardware
 
 | | |
 |---|---|
 | GPUs | 4× NVIDIA RTX PRO 6000 Blackwell Max-Q, 96 GB (SM120 / GB202) |
-| Interconnect | no NVLink — each GPU on its own PCIe gen5 x16 root port; all TP traffic crosses the CPU fabric |
+| Interconnect | no NVLink; each GPU on its own PCIe gen5 x16 root port, all TP traffic crosses the CPU fabric |
 | Host RAM | ≥ 128 GB recommended (the ~158 GB checkpoint is mmap'd) |
 | Driver / CUDA | 595-server-open / CUDA 13.0 (`cu130` base image) |
 
-Notes for this topology: TP=4 wins aggregate throughput, TP=2 wins bs=1
-latency (fewer PCIe hops); bs=1 decode is interconnect-latency bound, not
-bandwidth bound. EP4 helps bs=1 by shrinking the MoE all-reduce.
-`nvidia-smi topo -m` shows `NODE` for all pairs on this box.
+On this topology TP=4 wins aggregate throughput and TP=2 wins bs=1 latency (fewer PCIe hops). bs=1 decode is interconnect-latency bound, not bandwidth bound. EP4 helps bs=1 by shrinking the MoE all-reduce. `nvidia-smi topo -m` shows `NODE` for every pair on this box.
 
 ## Building the image yourself
 
-Equivalent to pulling the prebuilt image (the build is deterministic given
-the pinned base image + patch set). `.github/workflows/build-image.yml`
-automates build+push, but needs a self-hosted runner with ~100 GB free disk
-— the ~46 GB image does not fit GitHub-hosted runners.
+Equivalent to pulling the prebuilt one; the build is deterministic given the pinned base image and patch set. `.github/workflows/build-image.yml` automates build+push but needs a self-hosted runner with ~100 GB free disk. The ~46 GB image does not fit GitHub-hosted runners.
 
 ```sh
 git clone https://github.com/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000
@@ -135,14 +98,7 @@ docker compose -f docker-compose.example.yml up -d
 
 ## Measured performance
 
-`sglang.bench_serving`, random 1024-in / 512-out, measured **2026-08-05 on
-the exact image + compose in this repo** (only `--speculative-*` flags
-removed for the no-spec column). Numbers are output tok/s. The
-[concurrency sweep](#concurrency-and-operating-points) below is a separate
-later run of the same config, so its absolute figures differ by a few
-percent from this table (run-to-run variance on a thermally-soaked box);
-use the sweep for scaling shape and this table for the spec-vs-no-spec
-comparison.
+`sglang.bench_serving`, random 1024-in / 512-out, measured 2026-08-05 on the exact image and compose in this repo (only the `--speculative-*` flags removed for the no-spec column). Numbers are output tok/s. The [concurrency sweep](#concurrency-and-operating-points) below is a later run of the same config, so its absolute figures differ by a few percent (run-to-run variance on a thermally soaked box); use the sweep for scaling shape and this table for spec-vs-no-spec.
 
 | workload | no spec | DSPARK γ=4 | Δ |
 |---|---|---|---|
@@ -152,30 +108,15 @@ comparison.
 | conc 64 | 1511 | **2297** (mean ITL 25 ms) | +52% |
 | bs=1 decode | ~62 | **78–90** | |
 
-**Caveat — synthetic prompts flatter spec decode.** These are
-`bench_serving --dataset-name random` numbers. Random-token prompts drive
-the model into highly predictable (degenerate/repetitive) continuations,
-which DSPARK predicts almost perfectly: measured accept length 4.4–4.7 of
-5 draft tokens on random prompts, versus ~2.1 on real prose. Decode-bound
-figures above are therefore optimistic by roughly 2× for real agentic
-traffic. The bs=1 essay-prompt measurement (~85 tok/s) is the more
-representative single-stream number.
+One caveat you should not skip: synthetic prompts flatter spec decode. Random-token prompts drive the model into highly predictable continuations, which DSPARK predicts almost perfectly. We measured accept length 4.4–4.7 of 5 draft tokens on random prompts versus ~2.1 on real prose, so treat the decode-bound figures above as roughly 2× optimistic for real agentic traffic. The bs=1 essay-prompt measurement (~85 tok/s) is the more honest single-stream number.
 
-DSPARK accept length at γ=4: 2.0–2.2 of 5 verify rows on real text. Accept
-*length* is ~2.2 at every γ we tested (3, 4, 6, 7) — the draft head realises
-about the same number of tokens regardless of window, so wider windows only
-dilute the accept rate and cost bs=1 latency. γ=4 measured best at bs=1 with
-aggregate within ~4% of the widest window.
-Prefill: ~5.4K tok/s at 90K ctx, roughly flat to large context with the
-indexer-threshold env set (see the compose file; without it, prefill decays
-to ~2K tok/s at large ctx because every DP prefill chunk falls back to a
-paged-gather kernel).
+Accept length at γ=4 is 2.0–2.2 of 5 verify rows on real text, and it stays ~2.2 at every depth we tested (3, 4, 6, 7). The draft head realises about the same number of tokens regardless of window, so wider windows only dilute the accept rate and cost bs=1 latency. γ=4 measured best at bs=1 with aggregate within ~4% of the widest window.
+
+Prefill runs ~5.4K tok/s at 90K ctx and stays roughly flat to large context with the indexer-threshold env set (see the compose file). Without it, prefill decays to ~2K tok/s at large context because every DP prefill chunk falls back to a paged-gather kernel.
 
 ## Concurrency and operating points
 
-Concurrency sweep on this exact image, 1024-in / 512-out unless noted
-(random dataset — the synthetic-prompt caveat above applies to the absolute
-decode numbers; the scaling shape is the point here):
+Concurrency sweep on this exact image, 1024-in / 512-out unless noted. Random dataset, so the synthetic-prompt caveat applies to the absolute decode numbers; the scaling shape is the point here.
 
 | C | out tok/s | total tok/s | TTFT mean | TTFT P99 | ITL mean |
 |---|---|---|---|---|---|
@@ -189,25 +130,9 @@ decode numbers; the scaling shape is the point here):
 | 192 | 3,370 | 10,110 | 2.03 s | 12.9 s | 51.0 ms |
 | 256 | 3,316 | 9,948 | 4.52 s | 17.1 s | 65.7 ms |
 
-- **The knee is at C≈128.** 96→128 still scales (+13.9% throughput); past
-  128 you buy ≤2.3% more throughput for 2.6–5.8× the TTFT.
-- **Compute-bound, not cap-bound.** The TTFT inflection sets in below
-  `--max-running-requests 256`, and at C=256 the cap only just engages
-  (measured running concurrency 246.6) — raising the cap or
-  `--cuda-graph-max-bs` buys zero throughput and only deepens internal
-  queues.
-- **Recommended operating points:** C=32–64 for interactive agent work
-  (ITL 17–24 ms, TTFT ≤ 0.6 s); C=128 for max aggregate throughput.
+The knee is at C≈128: 96→128 still scales (+13.9% throughput), past 128 you buy ≤2.3% more throughput for 2.6–5.8× the TTFT. It's compute-bound, not cap-bound. The TTFT inflection sets in below `--max-running-requests 256`, and at C=256 the cap only just engages (measured running concurrency 246.6), so raising the cap or `--cuda-graph-max-bs` buys zero throughput and only deepens internal queues. We run C=32–64 for interactive agent work (ITL 17–24 ms, TTFT ≤ 0.6 s) and C=128 for max aggregate.
 
-Long context moves the knee. At 8192-in / 512-out the regime flips to
-prefill-bound — aggregate prefill tops out at ~9–11K tok/s — and the knee
-collapses to C ≤ 32: C=32 gives TTFT 4.0 s mean / 18 s P99, C=128 gives
-11.1 s mean / 70 s P99. Median ITL holds at 10–18 ms but P95 spikes to
-0.3–0.9 s as decode stalls behind prefill chunks (`--chunked-prefill-size
-4096` is 1024 per DP rank). Practically: keep effective concurrency ≤ 32
-for cold large contexts — a cold 50–270K-token context costs tens of
-seconds of TTFT at the prefill ceiling regardless of concurrency — while
-warm sessions fare better via radix-cache prefix hits.
+Long context moves the knee. At 8192-in / 512-out the regime flips to prefill-bound (aggregate prefill tops out around 9–11K tok/s) and the knee collapses to C ≤ 32: C=32 gives TTFT 4.0 s mean / 18 s P99, C=128 gives 11.1 s mean / 70 s P99. Median ITL holds at 10–18 ms but P95 spikes to 0.3–0.9 s as decode stalls behind prefill chunks (`--chunked-prefill-size 4096` is 1024 per DP rank). Practically: keep effective concurrency ≤ 32 for cold large contexts. A cold 50–270K-token context costs tens of seconds of TTFT at the prefill ceiling no matter what; warm sessions fare better via radix-cache prefix hits.
 
 ## Known issues
 
@@ -221,20 +146,11 @@ warm sessions fare better via radix-cache prefix hits.
 | 5 | **MoE runner must be `flashinfer_mxfp4`** for this checkpoint on SM120: default triton runner crashes ("Hidden size mismatch"), `flashinfer_trtllm` corrupts FP4 output (sglang#26324). | pinned in the compose |
 | 6 | **Custom all-reduce fails CUDA-graph capture** on PCIe GPU pairs (sglang#11957 class). | `--disable-custom-all-reduce` |
 
-Rejected/blocked levers, so you don't re-try them on this hardware:
-`--enable-flashinfer-allreduce-fusion` (SM90/SM10x only, crashes),
-`--enable-quant-communications` (NPU only), `--enable-torch-symm-mem`
-("Device capability 12 not supported"), NCCL P2P via IOMMU (engages but
-net-negative for decode latency here), `SGLANG_RAGGED_VERIFY_MODE=compact`
-(pre-#32467 it IMAs at graph capture; with #32467 it captures, but the
-depth-gated corruption above is independent of verify mode — this recipe
-serves `static`).
+Levers we tried and rejected, so you don't re-try them on this hardware: `--enable-flashinfer-allreduce-fusion` (SM90/SM10x only, crashes), `--enable-quant-communications` (NPU only), `--enable-torch-symm-mem` ("Device capability 12 not supported"), NCCL P2P via IOMMU (engages but net-negative for decode latency here), `SGLANG_RAGGED_VERIFY_MODE=compact` (pre-#32467 it IMAs at graph capture; with #32467 it captures, but the depth-gated corruption above is independent of verify mode, so this recipe serves `static`).
 
 ## The draft-depth corruption boundary (issue 1, in full)
 
-Spec decode is supposed to be distribution-preserving, so any temp-0
-divergence between spec-on and spec-off is a verify-path mis-commit, not a
-sampling artifact. What we measured, all on this hardware:
+Spec decode is supposed to be distribution-preserving, so any temp-0 divergence between spec-on and spec-off is a verify-path mis-commit, not a sampling artifact. What we measured, all on this hardware:
 
 | arm | base | γ | verify rows | verdict |
 |---|---|---|---|---|
@@ -247,77 +163,35 @@ sampling artifact. What we measured, all on this hardware:
 | + #32277 clamp backport | v0.5.16 | 5 | 6 | dirty 5/5 |
 | upstream `main` @ 211ee642 + rebased stack | main 2026-08-05 | 5 | 6 | **dirty 5/5** — live upstream, not an artifact of this backport stack |
 
-Rows at γ=3 and γ=4 are 5-cold-launch arms; γ=5/6/7 are single-launch screens
-of the same 4-phase load (~2.1–2.3K req), where the γ=5 control produced 10
-events — so a 0 there is a strong signal, not a small-sample artifact.
+The γ=3 and γ=4 rows are 5-cold-launch arms; γ=5/6/7 are single-launch screens of the same 4-phase load (~2.1–2.3K req), where the γ=5 control produced 10 events. A zero there is a strong signal, not a small-sample artifact.
 
-Because γ=5 is the checkpoint's native block size and its immediate
-neighbours are clean, the most likely explanation is a native-block-size
-specialised path (kernel instantiation or planner fast path selected when the
-requested block size equals the head's trained size) being wrong on SM120 —
-rather than any capacity, window or ring bound. Ruled out by measurement, not
-argument: c4 compress-state ring capacity (doubling it changed nothing —
-32 events / 10,209 req), verify window vs compress ratio (γ=4 and 6 cross the
-same boundaries and are clean), NaN logits, KV-store padding, the #32277
-sentinel clamp, CUTLASS-vs-Triton attention dispatch, and the config
-inference path (explicit γ=5 is equally dirty).
+γ=5 is the checkpoint's native block size and its immediate neighbours are clean, so the most likely explanation is a native-block-size specialised path (kernel instantiation or planner fast path selected when the requested block size equals the head's trained size) being wrong on SM120. Not a capacity, window, or ring bound. We ruled those out by measurement, not argument: c4 compress-state ring capacity (doubling it changed nothing, 32 events / 10,209 req), verify window vs compress ratio (γ=4 and 6 cross the same boundaries and are clean), NaN logits, KV-store padding, the #32277 sentinel clamp, CUTLASS-vs-Triton attention dispatch, and the config inference path (explicit γ=5 is equally dirty).
 
 Supporting evidence:
 
-- Greedy-invariant repro (~10 min, no benchmarks): boot with and without
-  `--speculative-*` at the same shape, send identical prompts at
-  `temperature: 0`, diff. At corrupting shapes the spec-on output is
-  garbage while spec-off is flawless.
-- [sglang#32183](https://github.com/sgl-project/sglang/pull/32183) (verifier
-  state rewrite window, `kMaxMTPDraftTokens=4` vs γ+1=6 verify rows) is the
-  closest upstream fix and is **necessary but insufficient**: with the
-  backport applied and instrumented, `verify_width=6` demonstrably reaches
-  the patched plan kernel — and γ=5 still corrupts. The ≤4-row assumption
-  is broken somewhere one level deeper.
-- External corroboration: [sglang#32666](https://github.com/sgl-project/sglang/issues/32666)
-  reports the same boundary on a different backend — depth 5: 23/24 runs
-  corrupt; depth 3: 0/607.
-- A NaN tripwire (sanitize-nan-logits ported into the DSPARK verify path)
-  fired **zero** times across all corrupting launches — the poisoned logits
-  are finite. Output classification, not NaN scrubbing, is the right
-  detector.
+- Greedy-invariant repro (~10 min, no benchmarks): boot with and without `--speculative-*` at the same shape, send identical prompts at `temperature: 0`, diff. At corrupting shapes the spec-on output is garbage while spec-off is flawless.
+- [sglang#32183](https://github.com/sgl-project/sglang/pull/32183) (verifier state rewrite window, `kMaxMTPDraftTokens=4` vs γ+1=6 verify rows) is the closest upstream fix and is necessary but insufficient: with the backport applied and instrumented, `verify_width=6` demonstrably reaches the patched plan kernel, and γ=5 still corrupts. The ≤4-row assumption is broken somewhere one level deeper.
+- External corroboration: [sglang#32666](https://github.com/sgl-project/sglang/issues/32666) reports the same boundary on a different backend: depth 5, 23/24 runs corrupt; depth 3, 0/607.
+- A NaN tripwire (sanitize-nan-logits ported into the DSPARK verify path) fired zero times across all corrupting launches. The poisoned logits are finite; output classification, not NaN scrubbing, is the right detector.
 
 ### Repro protocol (and why easier tests lie)
 
-Two things that do **not** reproduce this bug:
+Two things that do not reproduce this bug:
 
-- **Single-launch test batteries.** The fault is stochastic per server
-  launch. A config can pass a full correctness battery on one boot and
-  corrupt on the next. Anything less than ~5 cold launches per arm is
-  noise.
-- **Steady-concurrency soak.** Two 45-minute steady-load soaks (~8K
-  requests) came back clean on a config that then failed 5/5 under bursty
-  load. High accept rate with clean output also occurs, so accept-rate
-  drift is not a usable signature either.
+- **Single-launch test batteries.** The fault is stochastic per server launch. A config can pass a full correctness battery on one boot and corrupt on the next. Anything less than ~5 cold launches per arm is noise.
+- **Steady-concurrency soak.** Two 45-minute steady-load soaks (~8K requests) came back clean on a config that then failed 5/5 under bursty load. High accept rate with clean output also occurs, so accept-rate drift is not a usable signature either.
 
-What does reproduce it, 5/5: per arm, **5 cold launches × ~12 min of bursty
-load each** — phases of 3 min @ 4 workers, 3 min @ 20, 2 min @ 2, 4 min
-@ 14 — of **streaming** chat completions with thinking enabled
-(`chat_template_kwargs: {thinking: true}`, high reasoning effort), ~20-tool
-schemas, multi-turn conversations. Score outputs with a salad classifier:
-U+FFFD replacement chars, punctuation density, single-char spray, trigram
-loops. The batch-shape sweeps from burst transitions + streaming +
-thinking-on are what single-shape steady load never exercises.
+What does reproduce it, 5/5: per arm, 5 cold launches × ~12 min of bursty load each (phases of 3 min @ 4 workers, 3 min @ 20, 2 min @ 2, 4 min @ 14) of streaming chat completions with thinking enabled (`chat_template_kwargs: {thinking: true}`, high reasoning effort), ~20-tool schemas, multi-turn conversations. Score outputs with a salad classifier: U+FFFD replacement chars, punctuation density, single-char spray, trigram loops. The batch-shape sweeps from burst transitions + streaming + thinking-on are what single-shape steady load never exercises.
 
 ## Patches
 
-All patches apply to `lmsysorg/sglang:v0.5.16-cu130-runtime`.
-`prNNNNN-notest.diff` files are unmerged-at-pin-time upstream PR diffs,
-authorship belongs to their respective PR authors; test hunks stripped
-where the runtime image lacks the test tree. Paths are rewritten where
-v0.5.16 predates upstream's kernel-tree restructuring
-(`kernels/jit/csrc` ↔ `jit_kernel/csrc` etc.); details in each diff header.
+All patches apply to `lmsysorg/sglang:v0.5.16-cu130-runtime`. `prNNNNN-notest.diff` files are unmerged-at-pin-time upstream PR diffs, authorship belongs to their respective PR authors; test hunks stripped where the runtime image lacks the test tree. Paths are rewritten where v0.5.16 predates upstream's kernel-tree restructuring (`kernels/jit/csrc` ↔ `jit_kernel/csrc` etc.); details in each diff header.
 
 | patch | upstream | what it fixes |
 |---|---|---|
 | `dspark-sm120-decode-dispatch.diff` | ours — [sglang#33407](https://github.com/sgl-project/sglang/pull/33407) | DSPARK crashes at warmup on SM120: draft/verify batches with non-bucket indexer topk (192) fall through to the prefill kernel's `num_tokens > 64` assert. Pads indices to the next instantiated CUTLASS decode bucket with `-1` skip sentinels (scan capped via `topk_length`), Triton fallback for shapes that remain non-dispatchable. Same failure family as [#33134](https://github.com/sgl-project/sglang/issues/33134) (DGX Spark, sm_121) |
 | `dsv4-streaming-preamble-fix.diff` | ours — [sglang#33813](https://github.com/sgl-project/sglang/pull/33813), extending [#31786](https://github.com/sgl-project/sglang/pull/31786) | streaming detector returned no normal text on the tool-call branch, discarding assistant prose that shared a delta with the DSML opener. Upstream's fix covers `<｜DSML｜tool_calls>`; V4 also opens with a bare `<｜DSML｜invoke`, so this covers every marker form plus trailing partial-tag prefixes. Fixes known issue 1b |
-| `dsv4-c4-ring-depth-scale.diff` | ours — not yet filed | makes the c4 compress-state ring honour draft depth (it was a constant 16 while the SWA ring already scales with `speculative_num_draft_tokens`). Hardening only — **measured not to fix issue 1**; kept because a depth-independent ring is wrong on its face |
+| `dsv4-c4-ring-depth-scale.diff` | ours — not yet filed | makes the c4 compress-state ring honour draft depth (it was a constant 16 while the SWA ring already scales with `speculative_num_draft_tokens`). Hardening only — measured **not** to fix issue 1; kept because a depth-independent ring is wrong on its face |
 | `dsv4-store-padding-guard.diff` | ours — [sglang#33816](https://github.com/sgl-project/sglang/pull/33816) | `store.cuh` fused KV-store kernels skip padded slot-0 writes (implements the kernel's own documented intent) and fix a latent negative-page OOB **write** when the SWA LUT yields `-1`. Memory-safety hardening; verified not the cause of issue 1 |
 | `pr32332-notest.diff` | [#32332](https://github.com/sgl-project/sglang/pull/32332) OPEN | DSML streaming-detector buffer poisoning → garbled/duplicated/truncated tool-call arguments + error flood behind OpenAI-compatible proxies |
 | `pr32167-notest.diff` | [#32167](https://github.com/sgl-project/sglang/pull/32167) OPEN | tool calls completing in the final streamed delta delivered with empty arguments (common with spec decode) |
@@ -330,26 +204,23 @@ v0.5.16 predates upstream's kernel-tree restructuring
 | `pr32277-notest.diff` | [#32277](https://github.com/sgl-project/sglang/pull/32277) MERGED | clamps all-sentinel DSpark draft rows to token 0 in `_online_combine_kernel` (they otherwise emit an out-of-range token id into verify), plus NaN guards in the reject-sampling path. Measured **not** to fix known issue 1, kept as correctness hardening |
 | `pr31017-notest.diff` | [#31017](https://github.com/sgl-project/sglang/pull/31017) MERGED | MoE top-k renormalization epsilon for degenerate rows |
 
-This patch set is exactly the image the numbers above were measured on. Retire each backport when it lands in an sglang release. The stack also
-rebases cleanly onto upstream `main` (three of the diffs drop as merged,
-flashinfer pin becomes upstream's own) — but note that `main` does **not**
-fix known issue 1.
+This patch set is exactly the image the numbers above were measured on. Retire each backport when it lands in an sglang release. The stack also rebases cleanly onto upstream `main` (three of the diffs drop as merged, the flashinfer pin becomes upstream's own), but note that `main` does not fix known issue 1.
+
+## What here generalizes
+
+The name promises one exact rig. These parts don't need it:
+
+- **The draft-depth corruption (issue 1)** is a property of the DSpark draft head, not of this card count or this engine. If you run DSpark anywhere, vLLM included, and your stack infers the draft depth from the checkpoint, you are at depth 5, the one value we measured as broken. Independent reports match on other hardware ([sglang#32666](https://github.com/sgl-project/sglang/issues/32666), and the same phenotype under vLLM on the same GPUs in [rtx6kpro#53](https://github.com/local-inference-lab/rtx6kpro/issues/53)). Test your own depth before trusting any of us.
+- **The patches** are per-bug, not per-rig. The SM120 dispatch fix, the streaming-detector fixes, and the store guard apply to 2× and 8× configs the same way; ormandj's 2×-card repo already carries overlapping fixes.
+- **The pins** (flashinfer 0.6.15.post1 on this base; the DeepGEMM constraints) hold for Blackwell workstation silicon generally, not just four of them.
+- **What doesn't travel:** every tuned number. TP4/DP4/EP4, mem-fraction, chunk size, γ=4, and all benchmarks are 4×-specific measurements. On different hardware, re-measure; the repro protocol above is the part you can reuse.
 
 ## Related work
 
-- [ormandj/sglang-deepseek-v4-flash-sm120](https://github.com/ormandj/sglang-deepseek-v4-flash-sm120)
-  — same model/framework/silicon on 2× RTX PRO 6000, TP=2. The
-  lock-and-verify repo structure there is worth copying.
-- [0xSero/deepseek-v4-flash-sm120](https://github.com/0xSero/deepseek-v4-flash-sm120)
-  — the earliest SM120 recipe for this model family.
-- [vllm#41834](https://github.com/vllm-project/vllm/pull/41834) — the
-  SM12x/DSpark track on vLLM; also the source of the healthy accept-rate
-  calibration (draft accept 0.1–0.3 is normal for this checkpoint — low
-  accept is not by itself a corruption signal).
+- [ormandj/sglang-deepseek-v4-flash-sm120](https://github.com/ormandj/sglang-deepseek-v4-flash-sm120) — same model/framework/silicon on 2× RTX PRO 6000, TP=2. The lock-and-verify repo structure there is worth copying.
+- [0xSero/deepseek-v4-flash-sm120](https://github.com/0xSero/deepseek-v4-flash-sm120) — the earliest SM120 recipe for this model family.
+- [vllm#41834](https://github.com/vllm-project/vllm/pull/41834) — the SM12x/DSpark track on vLLM; also the source of the healthy accept-rate calibration (draft accept 0.1–0.3 is normal for this checkpoint — low accept is not by itself a corruption signal).
 
 ## License
 
-Apache-2.0 (see `LICENSE`, `NOTICE`). Patches under `patches/` are
-derivative works of [SGLang](https://github.com/sgl-project/sglang)
-(Apache-2.0); the unmerged PR diffs remain the work of their upstream
-authors.
+Apache-2.0 (see `LICENSE`, `NOTICE`). Patches under `patches/` are derivative works of [SGLang](https://github.com/sgl-project/sglang) (Apache-2.0); the unmerged PR diffs remain the work of their upstream authors.
