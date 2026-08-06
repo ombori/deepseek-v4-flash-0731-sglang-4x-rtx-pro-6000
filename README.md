@@ -138,6 +138,15 @@ removed for the no-spec column). Numbers are output tok/s.
 | conc 64 | 1511 | **2297** (mean ITL 25 ms) | +52% |
 | bs=1 decode | ~62 | **78–90** | |
 
+**Caveat — synthetic prompts flatter spec decode.** These are
+`bench_serving --dataset-name random` numbers. Random-token prompts drive
+the model into highly predictable (degenerate/repetitive) continuations,
+which DSPARK predicts almost perfectly: measured accept length 4.4–4.7 of
+5 draft tokens on random prompts, versus ~2.1 on real prose. Decode-bound
+figures above are therefore optimistic by roughly 2× for real agentic
+traffic. The bs=1 essay-prompt measurement (~85 tok/s) is the more
+representative single-stream number.
+
 DSPARK accept length at γ=4: 2.0–2.2 of 5 verify rows on real text. Accept
 *length* is ~2.2 at every γ we tested (3, 4, 6, 7) — the draft head realises
 about the same number of tokens regardless of window, so wider windows only
@@ -147,6 +156,43 @@ Prefill: ~5.4K tok/s at 90K ctx, roughly flat to large context with the
 indexer-threshold env set (see the compose file; without it, prefill decays
 to ~2K tok/s at large ctx because every DP prefill chunk falls back to a
 paged-gather kernel).
+
+## Concurrency and operating points
+
+Concurrency sweep on this exact image, 1024-in / 512-out unless noted
+(random dataset — the synthetic-prompt caveat above applies to the absolute
+decode numbers; the scaling shape is the point here):
+
+| C | out tok/s | total tok/s | TTFT mean | TTFT P99 | ITL mean |
+|---|---|---|---|---|---|
+| 1 | 171 | 513 | 200 ms | 228 ms | 5.5 ms |
+| 8 | 767 | 2,300 | 343 ms | 1.0 s | 9.4 ms |
+| 16 | 1,171 | 3,513 | 443 ms | 1.3 s | 12.2 ms |
+| 32 | 1,734 | 5,201 | 448 ms | 1.2 s | 16.9 ms |
+| 64 | 2,467 | 7,401 | 565 ms | 2.2 s | 23.7 ms |
+| 96 | 2,892 | 8,677 | 684 ms | 3.2 s | 30.4 ms |
+| 128 | 3,293 | 9,880 | 777 ms | 3.7 s | 35.6 ms |
+| 192 | 3,370 | 10,110 | 2.03 s | 12.9 s | 51.0 ms |
+| 256 | 3,316 | 9,948 | 4.52 s | 17.1 s | 65.7 ms |
+
+- **The knee is at C≈128.** 96→128 still scales (+13.9% throughput); past
+  128 you buy ≤2.3% more throughput for 2.6–5.8× the TTFT.
+- **Compute-bound, not cap-bound.** The TTFT inflection sets in below
+  `--max-running-requests 256`, and at C=256 the cap only just engages
+  (measured running concurrency 246.6) — raising the cap or
+  `--cuda-graph-max-bs` buys zero throughput and only deepens internal
+  queues.
+- **Recommended operating points:** C=32–64 for interactive agent work
+  (ITL 17–24 ms, TTFT ≤ 0.6 s); C=128 for max aggregate throughput.
+
+Long context moves the knee. At 8192-in / 512-out the regime flips to
+prefill-bound — aggregate prefill tops out at ~9–11K tok/s — and the knee
+collapses to C ≤ 32: C=32 gives TTFT 4.0 s mean / 18 s P99, C=128 gives
+11.1 s mean / 70 s P99. Median ITL holds at 10–18 ms but P95 spikes to
+0.3–0.9 s as decode stalls behind prefill chunks (`--chunked-prefill-size
+4096` is 1024 per DP rank). Practically: keep effective concurrency ≤ 32
+for cold large contexts; warm sessions fare better via radix-cache prefix
+hits.
 
 ## Known issues
 
