@@ -191,8 +191,9 @@ collapses to C ≤ 32: C=32 gives TTFT 4.0 s mean / 18 s P99, C=128 gives
 11.1 s mean / 70 s P99. Median ITL holds at 10–18 ms but P95 spikes to
 0.3–0.9 s as decode stalls behind prefill chunks (`--chunked-prefill-size
 4096` is 1024 per DP rank). Practically: keep effective concurrency ≤ 32
-for cold large contexts; warm sessions fare better via radix-cache prefix
-hits.
+for cold large contexts — a cold 50–270K-token context costs tens of
+seconds of TTFT at the prefill ceiling regardless of concurrency — while
+warm sessions fare better via radix-cache prefix hits.
 
 ## Known issues
 
