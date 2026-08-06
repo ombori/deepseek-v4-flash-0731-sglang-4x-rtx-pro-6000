@@ -38,6 +38,18 @@ services:
       # If you change dp-size or chunked-prefill-size, recompute this as
       # chunked_prefill_size / dp_size.
       SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS: "1024"
+      # The #29927 prefill recipe (needs the pr29927 patch + the
+      # sgl-deep-gemm 0.1.5.post1 bump, both in this repo's Dockerfile).
+      # The first two route the DSV4 indexer's paged MQA logits to
+      # DeepGEMM's fp8 kernel instead of the torch/TileLang fallbacks;
+      # the third enables the DeepGEMM hyperconnection-prenorm path.
+      # Measured together on this rig: prefill +19-25% at 256-512K
+      # contexts (TTFT -16-20%), decode unchanged. Attribution if you
+      # must drop one: HC prenorm carries most of the win (+12% alone
+      # at 256K), the indexer adds ~+3%.
+      SGLANG_FP8_PAGED_MQA_LOGITS_TORCH: "0"
+      SGLANG_OPT_USE_TILELANG_INDEXER: "0"
+      SGLANG_OPT_DEEPGEMM_HC_PRENORM: "1"
     deploy:
       resources:
         reservations:
@@ -78,11 +90,13 @@ services:
       - --ep-size
       - "4"
       - --trust-remote-code
-      # 0.90 per DeepSeek's official 0731+DSPARK recipe. If you see
-      # transient-alloc OOMs under concurrent ~1M-ctx prefill (or run
-      # anything else on these GPUs), drop to 0.88 first.
+      # 0.85 (was 0.90 per DeepSeek's official 0731+DSPARK recipe): the
+      # DeepGEMM prefill paths enabled above allocate transient workspace
+      # outside the static pool, and 0.85 is the shape every benchmark
+      # number and the 5-cold-launch ship gate were measured at. If you
+      # disable the three SGLANG_* prefill envs, 0.90 is fine again.
       - --mem-fraction-static
-      - "0.90"
+      - "0.85"
       - --context-length
       - "1048576"
       # DeepSeek's recommended value for the 0731 launch recipe.
