@@ -1,0 +1,92 @@
+--- a/python/sglang/kernels/ops/attention/flash_mla_sm120.py	2026-08-03 13:51:08
++++ b/python/sglang/kernels/ops/attention/flash_mla_sm120.py	2026-08-03 14:03:29
+@@ -437,6 +437,89 @@
+         else extra_indices
+     )
+ 
++    # --- Bucket alignment for non-instantiated topk widths ---
++    # The CUTLASS SM120 kernels are instantiated for fixed topk widths
++    # (decode: (num_heads, topk) table with topk in {128, 512, 1024};
++    # prefill orchestrator: topk buckets {128, 512, 1024, 2048}), and
++    # the prefill kernel additionally hard-asserts num_tokens > 64.
++    # DSPARK's draft indexer emits topk=192 — in no bucket on either
++    # path — so both the warmup draft pass (num_tokens=5 → prefill
++    # kernel → "num_tokens > 64" check fail) and the draft CUDA-graph
++    # capture (unsharded draft head: num_heads=64, large capture
++    # batches → "Unsupported sparse-MLA prefill configuration ...
++    # topk=192") crash the server at boot. Same failure family as
++    # sgl-project/sglang#33134 (DGX Spark, sm_121).
++    #
++    # Fix: right-pad the index tensor with -1 (the kernels' documented
++    # "skip" sentinel — see flashinfer csrc/sparse_mla_sm120.cu) up to
++    # the next instantiated bucket, and cap the scan via topk_length so
++    # the padding is never read. Applied to BOTH the decode-sized and
++    # prefill-sized paths. If a decode-sized shape still isn't
++    # dispatchable (e.g. draft d_qk != 512), fall back to the Triton
++    # sparse-decode kernel for that call instead of crashing.
++    _SUPPORTED_TOPK_WIDTHS = (128, 512, 1024, 2048)
++    _topk0 = idx.shape[-1]
++    _d_qk0 = q.shape[-1]
++    if _d_qk0 == 512 and _topk0 not in _SUPPORTED_TOPK_WIDTHS:
++        _next_w = next((t for t in _SUPPORTED_TOPK_WIDTHS if t >= _topk0), None)
++        if _next_w is not None:
++            if topk_length is None:
++                # Cap the scan at the true width so the -1 padding is
++                # never even read.
++                topk_length = torch.full((B,), _topk0, dtype=torch.int32, device=dev)
++            idx = torch.nn.functional.pad(idx, (0, _next_w - _topk0), value=-1)
++            if not getattr(_flash_mla_flashinfer, "_noted_bucket_pad", False):
++                _flash_mla_flashinfer._noted_bucket_pad = True
++                logger.info(
++                    "SM120 sparse-MLA: padding topk %d -> %d (next "
++                    "instantiated bucket, -1 skip sentinel; scan capped "
++                    "via topk_length).",
++                    _topk0,
++                    _next_w,
++                )
++
++    if B <= _FI_DECODE_MAX_TOKENS:
++        from flashinfer.mla._sparse_mla_sm120 import _decode_dsv4_dispatchable
++
++        _extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
++        if not _decode_dsv4_dispatchable(
++            B, H, idx.shape[-1], _d_qk0, _PBS_DST, _extra_topk
++        ):
++            # Decode-sized but not coverable by the CUTLASS decode
++            # kernel even after bucket padding (e.g. d_qk != 512 or an
++            # uninstantiated head count) — the prefill kernel would
++            # reject num_tokens <= 64, so route to Triton instead of
++            # crashing.
++            if not getattr(_flash_mla_flashinfer, "_warned_triton_fb", False):
++                _flash_mla_flashinfer._warned_triton_fb = True
++                logger.warning(
++                    "SM120 sparse-MLA: decode-sized batch not dispatchable "
++                    "to CUTLASS decode kernel (num_tokens=%d heads=%d "
++                    "topk=%d d_qk=%d) — using Triton fallback for these "
++                    "calls.",
++                    B,
++                    H,
++                    idx.shape[-1],
++                    _d_qk0,
++                )
++            from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
++                flash_mla_sparse_decode_triton,
++            )
++
++            out, lse = flash_mla_sparse_decode_triton(
++                q,
++                k_cache,
++                indices,
++                topk_length,
++                attn_sink,
++                head_dim_v,
++                softmax_scale,
++                extra_k_cache,
++                extra_indices,
++                extra_topk_length,
++            )
++            return (out, lse)
++
+     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
+     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
+ 

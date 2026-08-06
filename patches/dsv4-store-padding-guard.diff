@@ -1,0 +1,62 @@
+--- a/python/sglang/jit_kernel/csrc/deepseek_v4/store.cuh
++++ b/python/sglang/jit_kernel/csrc/deepseek_v4/store.cuh
+@@ -47,6 +47,14 @@
+   // prefetch the index
+   const auto index = static_cast<const IndicesT*>(indices)[bid];
+   // always load the value from input (don't store if invalid)
++  // GUARD (ombori backport, #32477-class): CUDA-graph padding rows carry
++  // out_cache_loc 0 (the pool's reserved sink slot) and can be negative on
++  // some paths. Storing undefined K/V into slot 0 poisons the page that the
++  // SWA page-table padding also points at -> partially-valid tiles read the
++  // garbage back before masking -> NaN -> out-of-vocab salad. The comment
++  // above always intended this guard; it was never implemented. Uniform per
++  // block, so no divergence; PDL trigger still fires below.
++  const bool store_valid = index > 0;
+   using Float2 = packed_t<Float>;
+   const auto elems = static_cast<const Float2*>(input)[tid + bid * 256];
+   if (wid != 7) {
+@@ -61,15 +69,19 @@
+     const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+     const auto value_ptr = pointer::offset(page_ptr, offset * 576);
+     const auto scale_ptr = pointer::offset(page_ptr, 576 << kPageBits, offset * 8);
+-    static_cast<fp8x2_e4m3_t*>(value_ptr)[tid] = result;
+-    static_cast<uint8_t*>(scale_ptr)[wid] = scale_ue8m0;
++    if (store_valid) {
++      static_cast<fp8x2_e4m3_t*>(value_ptr)[tid] = result;
++      static_cast<uint8_t*>(scale_ptr)[wid] = scale_ue8m0;
++    }
+   } else {
+     const auto result = cast<bf16x2_t>(elems);
+     const int32_t page = index >> kPageBits;
+     const int32_t offset = index & ((1 << kPageBits) - 1);
+     const auto page_ptr = pointer::offset(cache, page * kPageBytes);
+     const auto value_ptr = pointer::offset(page_ptr, offset * 576, 448);
+-    static_cast<bf16x2_t*>(value_ptr)[tid - 7 * 32] = result;
++    if (store_valid) {
++      static_cast<bf16x2_t*>(value_ptr)[tid - 7 * 32] = result;
++    }
+   }
+ 
+   PDLTriggerSecondary<kUsePDL>();
+@@ -95,6 +107,8 @@
+   // prefetch the index
+   const auto index = static_cast<const IndicesT*>(indices)[global_wid];
+   // always load the value from input (don't store if invalid)
++  // GUARD (ombori backport, #32477-class) — see fused_store_flashmla_cache.
++  const bool store_valid = index > 0;
+   using Float2 = packed_t<Float>;
+   using InStorage = AlignedVector<Float2, 2>;
+   using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
+@@ -114,8 +128,10 @@
+   OutStorage result;
+   result[0] = pack_fp8(x0 * inv_scale, x1 * inv_scale);
+   result[1] = pack_fp8(y0 * inv_scale, y1 * inv_scale);
+-  static_cast<OutStorage*>(value_ptr)[lane_id] = result;
+-  static_cast<float*>(scale_ptr)[0] = scale;
++  if (store_valid) {
++    static_cast<OutStorage*>(value_ptr)[lane_id] = result;
++    static_cast<float*>(scale_ptr)[0] = scale;
++  }
+ 
+   PDLTriggerSecondary<kUsePDL>();
+ }

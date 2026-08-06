@@ -1,0 +1,14 @@
+deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000
+Copyright 2026 Ombori
+
+This repository contains patch files (patches/) that are derivative works
+of SGLang (https://github.com/sgl-project/sglang), licensed under the
+Apache License, Version 2.0. Several of these patches are unmerged
+upstream pull-request diffs authored by their respective SGLang
+contributors, carried here (with test hunks stripped) until they land in
+a release; per-patch authorship and upstream status are recorded in the
+README patch table.
+
+The image build installs FlashInfer
+(https://github.com/flashinfer-ai/flashinfer), licensed under the Apache
+License, Version 2.0.

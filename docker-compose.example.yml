@@ -1,0 +1,132 @@
+# DeepSeek-V4-Flash-0731 on 4x RTX PRO 6000 Blackwell (SM120), TP4/DP4/EP4,
+# DSPARK speculative decoding at draft depth 3. This is the exact serving
+# shape the README benchmarks were measured on.
+#
+# Prerequisites:
+#   - image built from this repo's Dockerfile (see README quickstart)
+#   - the DeepSeek-V4-Flash-0731 checkpoint on local disk (~158 GB)
+#   - >= 128 GB host RAM recommended (the checkpoint is mmap'd)
+
+name: sglang
+
+services:
+  sglang:
+    image: sglang:v0.5.16-dsv4-sm120
+    container_name: sglang
+    restart: unless-stopped
+    init: true
+    ipc: host
+    shm_size: "32gb"
+    ports:
+      - "8000:30000"
+    volumes:
+      # Adjust the host side to wherever your checkpoints live.
+      - /models:/models:ro
+      # Persistent JIT/HF artifact cache — without it /root/.cache is
+      # rebuilt on every container recreate (slow first boot each time).
+      - ./sglang-cache:/root/.cache
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0,1,2,3"
+      HF_HOME: /root/.cache/huggingface
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      # Force the DSV4 indexer's fast contiguous DeepGEMM MQA-logits path
+      # for prefill chunks. The default threshold is 8192 query rows, but
+      # under --enable-dp-attention sglang divides --chunked-prefill-size
+      # by dp_size, so each DP rank's prefill chunk is 4096/4 = 1024 rows —
+      # above-threshold chunks silently fall back to the much slower
+      # paged-gather kernel and prefill throughput decays at large context.
+      # If you change dp-size or chunked-prefill-size, recompute this as
+      # chunked_prefill_size / dp_size.
+      SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS: "1024"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "1", "2", "3"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:30000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 120
+      # First boot compiles JIT kernels + runs flashinfer autotune; be patient.
+      start_period: 900s
+    entrypoint: ["python3", "-m", "sglang.launch_server"]
+    command:
+      - --model-path
+      - /models/DeepSeek-V4-Flash-0731
+      - --served-model-name
+      - deepseek-v4-flash
+      - --host
+      - 0.0.0.0
+      - --port
+      - "30000"
+      - --tp-size
+      - "4"
+      # DP attention (DeepSeek's recommended large-scale shape): MLA
+      # attention is small, so each GPU keeps full attention weights and
+      # its own KV shard; MoE stays EP. Requires patches/pr33098 —
+      # without it the first request under DP+DSPARK crashes the scheduler.
+      - --dp-size
+      - "4"
+      - --enable-dp-attention
+      - --enable-dp-lm-head
+      # Expert parallelism: replaces the MoE's per-layer TP all-reduce
+      # with a small all-to-all. On a PCIe-only box (no NVLink) this is
+      # worth ~+8-10% bs=1 decode at zero KV-pool cost.
+      - --ep-size
+      - "4"
+      - --trust-remote-code
+      # 0.90 per DeepSeek's official 0731+DSPARK recipe. If you see
+      # transient-alloc OOMs under concurrent ~1M-ctx prefill (or run
+      # anything else on these GPUs), drop to 0.88 first.
+      - --mem-fraction-static
+      - "0.90"
+      - --context-length
+      - "1048576"
+      # DeepSeek's recommended value for the 0731 launch recipe.
+      - --swa-full-tokens-ratio
+      - "0.1"
+      # Decode CUDA graphs cap at bs=64 PER DP RANK, so 256 global
+      # running requests stay on-graph. With dp-size 1 use 64 here.
+      - --max-running-requests
+      - "256"
+      - --cuda-graph-max-bs
+      - "64"
+      # fp8 KV is mandatory for DSV4 in sglang (the dsv4 sparse-attention
+      # KV pool asserts uint8 storage; bf16 crash-loops).
+      - --kv-cache-dtype
+      - fp8_e4m3
+      # SM120 requires the FlashInfer MXFP4 MoE runner for this checkpoint:
+      # the default triton runner crashes ("Hidden size mismatch") and
+      # flashinfer_trtllm corrupts FP4 output (sgl-project/sglang#26324).
+      - --moe-runner-backend
+      - flashinfer_mxfp4
+      # DSPARK: DeepSeek's block-drafter for 0731 (draft head bundled in
+      # the checkpoint — no separate draft model).
+      - --speculative-algorithm
+      - DSPARK
+      - --speculative-attention-mode
+      - decode
+      # DRAFT DEPTH 4 — set EXPLICITLY, and never omit this flag. Omitting
+      # it infers the checkpoint's native block size (5), which is the one
+      # value that corrupts output on SM120 (v0.5.16 AND upstream main as
+      # of 2026-08-05). Depths 3, 4, 6 and 7 are all clean; only 5 is
+      # broken. See README "Known issues" #1 before changing this.
+      - --speculative-dspark-block-size
+      - "4"
+      # sgl_kernel custom allreduce fails CUDA-graph capture on PCIe GPU
+      # pairs (sglang#11957 class).
+      - --disable-custom-all-reduce
+      # Smaller chunks give the scheduler more frequent checkpoints to
+      # interleave decode between prefill steps (decode-starvation
+      # mitigation); measured no aggregate-throughput cost vs 8192.
+      - --chunked-prefill-size
+      - "4096"
+      - --reasoning-parser
+      - deepseek-v4
+      - --tool-call-parser
+      - deepseekv4
+      # Returns cached_tokens in usage.prompt_tokens_details (free).
+      - --enable-cache-report

@@ -1,0 +1,112 @@
+diff --git a/python/sglang/srt/speculative/dspark_components/kernels/dspark_draft_model.py b/python/sglang/srt/speculative/dspark_components/kernels/dspark_draft_model.py
+index 2ea446ce7d5f..5915c090b706 100644
+--- a/python/sglang/srt/speculative/dspark_components/kernels/dspark_draft_model.py
++++ b/python/sglang/srt/speculative/dspark_components/kernels/dspark_draft_model.py
+@@ -143,7 +143,11 @@ def _online_combine_kernel(
+     rescaled = tl.where(mask, rescaled, -1.0)
+     best = tl.max(rescaled, axis=0)
+     cand = tl.where(rescaled == best, idxs, _IDX_SENTINEL)
+-    tl.store(next_tokens_ptr + row, tl.min(cand, axis=0).to(tl.int64))
++    next_token = tl.min(cand, axis=0)
++    # Degenerate rows (e.g. all -inf logits) leave cand all-sentinel; clamp to 0
++    # so a valid token id is emitted instead of an out-of-range 2147483647.
++    next_token = tl.where(next_token == _IDX_SENTINEL, 0, next_token)
++    tl.store(next_tokens_ptr + row, next_token.to(tl.int64))
+ 
+ 
+ def sample_step_tokens_triton(
+diff --git a/python/sglang/srt/speculative/dspark_components/kernels/dspark_verify_window.py b/python/sglang/srt/speculative/dspark_components/kernels/dspark_verify_window.py
+index c8070210ec1f..f6c6aa6cac60 100644
+--- a/python/sglang/srt/speculative/dspark_components/kernels/dspark_verify_window.py
++++ b/python/sglang/srt/speculative/dspark_components/kernels/dspark_verify_window.py
+@@ -384,6 +384,10 @@ def compact_row_index_triton(
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     verify_lens = verify_lens.to(device=device, dtype=torch.int64).contiguous()
+     bs = verify_lens.shape[0]
++    # The search converges only for bs <= 2**(NBITS-1); beyond it silently mismaps.
++    assert bs <= 1 << (
++        _SEARCH_NBITS - 1
++    ), f"bs={bs} exceeds row-index search capacity {1 << (_SEARCH_NBITS - 1)}"
+     incl = torch.cumsum(verify_lens, dim=0).contiguous()
+     req = torch.empty(padded_total, dtype=torch.int64, device=device)
+     within = torch.empty(padded_total, dtype=torch.int64, device=device)
+diff --git a/python/sglang/kernels/ops/speculative/reject_sampling.py b/python/sglang/kernels/ops/speculative/reject_sampling.py
+index 7eb4d65ca338..fd32ca3ea1b9 100644
+--- a/python/sglang/kernels/ops/speculative/reject_sampling.py
++++ b/python/sglang/kernels/ops/speculative/reject_sampling.py
+@@ -111,6 +111,8 @@ def speculative_sampling_classic_kernel(
+         else:
+             q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+             q_val = tl.load(q_ptr, mask=mask, other=0.0)
++            # Treat NaN q (degenerate draft rows) as 0: residual falls back to p.
++            q_val = tl.where(q_val == q_val, q_val, 0.0)
+             diff = p_val - q_val
+             val = tl.where(diff > 0.0, diff, 0.0)
+ 
+@@ -137,6 +139,8 @@ def speculative_sampling_classic_kernel(
+             else:
+                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
++                # Same NaN-q guard as pass 1.
++                q_val = tl.where(q_val == q_val, q_val, 0.0)
+                 diff = p_val - q_val
+                 val = tl.where(diff > 0.0, diff, 0.0)
+ 
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+index bc2e3cc56099..01f79b3e2327 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+@@ -26,6 +26,7 @@
+     spec_scale_global_num_tokens,
+ )
+ from sglang.srt.speculative.spec_utils import draft_tp_context
++from sglang.srt.utils.async_probe import maybe_detect_nan
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -180,11 +181,13 @@ def sample_draft_block(
+     if not any_sampling:
+ 
+         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
++            maybe_detect_nan(step_logits, f"dspark draft step {step_idx}")
+             return torch.argmax(step_logits, dim=-1)
+ 
+     else:
+ 
+         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
++            maybe_detect_nan(step_logits, f"dspark draft step {step_idx}")
+             if fast_sampling:
+                 exp_noise = torch.empty(
+                     step_logits.shape, dtype=torch.float32, device=step_logits.device
+@@ -199,6 +202,11 @@ def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+                 probs = torch.softmax(
+                     step_logits.float() / temperatures[:, None], dim=-1
+                 )
++                # All-NaN rows make multinomial raise; clamp to one-hot token 0.
++                degenerate_rows = torch.isnan(probs[:, :1])
++                one_hot_token0 = torch.zeros_like(probs)
++                one_hot_token0[:, 0] = 1.0
++                probs = torch.where(degenerate_rows, one_hot_token0, probs)
+                 argmax_tokens = torch.argmax(step_logits, dim=-1)
+                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                 return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+index 0302d75b1f8b..b95de46cc8ea 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+@@ -37,6 +37,7 @@
+     scatter_compact_to_strided_into,
+ )
+ from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
++from sglang.srt.utils.async_probe import maybe_detect_nan
+ 
+ 
+ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
+@@ -677,6 +678,7 @@ def accept_draft_tokens(
+         temperatures=draft_block.temperatures,
+         rows_per_request=gamma_rows,
+     ).view(bs, gamma_rows, vocab)
++    maybe_detect_nan(draft_probs, "dspark verify: draft_probs")
+     if not sampling_info.is_any_greedy:
+         return AcceptSampling.execute(
+             candidates=candidates,

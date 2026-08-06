@@ -1,0 +1,89 @@
+diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+index 11d3938ae2..464e4754fa 100644
+--- a/python/sglang/srt/speculative/dflash_utils.py
++++ b/python/sglang/srt/speculative/dflash_utils.py
+@@ -116,7 +116,7 @@ def apply_dflash_verify_logits_adjustments(
+     """Apply sampling-time logit adjustments for DFlash verify in place.
+ 
+     This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
+-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
++    use the cheaper precomputed `acc_additive_penalties` path instead of allocating a
+     repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+     """
+     if sampling_info is None:
+@@ -143,7 +143,7 @@ def apply_dflash_verify_logits_adjustments(
+             num_tokens_in_batch=draft_token_num,
+         )
+ 
+-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
++    acc_additive_penalties = getattr(sampling_info, "acc_additive_penalties", None)
+     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+     vocab_mask = getattr(sampling_info, "vocab_mask", None)
+     logit_bias = getattr(sampling_info, "logit_bias", None)
+@@ -157,10 +157,10 @@ def apply_dflash_verify_logits_adjustments(
+         return logits_3d
+ 
+     # Dense fallback only when we need live penalizer application or a vocab mask.
+-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
++    # In overlap scheduling the common path is `acc_additive_penalties`, which can be
+     # broadcast over the verify block without materializing a repeated buffer.
+     if (
+-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
++        penalizer is not None and penalizer.is_required and acc_additive_penalties is None
+     ) or vocab_mask is not None:
+         linear_penalty = torch.zeros(
+             (bs, next_token_logits.shape[1]),
+@@ -173,16 +173,16 @@ def apply_dflash_verify_logits_adjustments(
+         )
+         return
+ 
+-    if acc_linear_penalties is not None:
++    if acc_additive_penalties is not None:
+         if (
+-            acc_linear_penalties.device != next_token_logits.device
+-            or acc_linear_penalties.dtype != next_token_logits.dtype
++            acc_additive_penalties.device != next_token_logits.device
++            or acc_additive_penalties.dtype != next_token_logits.dtype
+         ):
+-            acc_linear_penalties = acc_linear_penalties.to(
++            acc_additive_penalties = acc_additive_penalties.to(
+                 device=next_token_logits.device,
+                 dtype=next_token_logits.dtype,
+             )
+-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
++        get_logits_3d().add_(acc_additive_penalties[:, None, :])
+ 
+     if logit_bias is not None:
+         if (
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+index 43099c9fe5..0971a0496d 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+@@ -44,7 +44,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
+         return True
+     if sampling_info.has_custom_logit_processor:
+         return False
+-    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
++    if getattr(sampling_info, "acc_additive_penalties", None) is not None:
+         return False
+     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+     if penalizer is not None and penalizer.is_required:
+diff --git a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
+index 39c7ef31b7..20cd472cca 100644
+--- a/python/sglang/srt/speculative/spec_utils.py
++++ b/python/sglang/srt/speculative/spec_utils.py
+@@ -834,6 +834,14 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
+     prep on its draft input -- the dispatcher routes.
+     """
+     if batch.spec_algorithm.is_dflash_family():
++        # Accumulate penalty. Same relaxed (one step == one token) accounting
++        # EAGLE does in eagle_prepare_for_decode; without it the seen-token
++        # state never advances for the dflash family. In particular
++        # BatchedMinNewTokensPenalizer.len_output_tokens would stay 0, so the
++        # min_new_tokens stop-token mask folded into acc_additive_penalties
++        # would never lift.
++        if batch.sampling_info.penalizer_orchestrator.is_required:
++            batch.cumulate_penalty_output_tokens()
+         batch.spec_info.prepare_for_decode(batch)
+     else:
+         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode

@@ -1,0 +1,161 @@
+diff --git a/python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh b/python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh
+index c86b92135437..484cb66393d1 100644
+--- a/python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh
++++ b/python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh
+@@ -448,6 +448,8 @@ using PrefillPlan = tvm::ffi::Tuple<tvm::ffi::Tensor, tvm::ffi::Tensor>;
+  * @param compress_plan     `[num_q_tokens, 16]` uint8 (output)
+  * @param write_plan        `[num_q_tokens,  8]` uint8 (output)
+  * @param compress_ratio 4 for c4, 128 for c128
++ * @param verify_width Number of verifier rows that must be rewritten; 0 keeps
++ *                     the default prefill behavior
+  * @param use_cuda_graph Whether the plans will be used with cuda graph (affects padding)
+  * @return (compress plan tensor, write plan tensor)
+  */
+@@ -462,6 +464,7 @@ inline PrefillPlan plan_compress_prefill(
+     const int32_t compress_ratio,
+     const int32_t swa_page_size,
+     const int32_t ring_size,
++    const int32_t verify_width,
+     const bool use_cuda_graph) {
+   auto B = SymbolicSize{"batch_size"};
+   auto N = SymbolicSize{"num_q_tokens"};
+@@ -507,12 +510,13 @@ inline PrefillPlan plan_compress_prefill(
+   RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+   // `swa_page_size` >= `ring_size` >= `compress_ratio`
+   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
++  RuntimeCheck(0 <= verify_width && verify_width <= ring_size - compress_ratio);
+ 
+   const auto device = device_.unwrap();
+   const auto stream = LaunchKernel::resolve_device(device);
+ 
+   constexpr int32_t kMaxMTPDraftTokens = 4;
+-  const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
++  const auto mtp_pad = verify_width > 0 ? verify_width : std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
+ 
+   if (cpu_or_gpu.unwrap().device_type == kDLGPU) {
+     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
+@@ -573,7 +577,9 @@ inline PrefillPlan plan_compress_prefill(
+     const int32_t extend_len = ext_ptr[i];
+     const int32_t prefix_len = seq_len - extend_len;
+     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
+-    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
++    const int32_t default_first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
++    const int32_t first_w_pos =
++        verify_width > 0 ? std::min(default_first_w_pos, seq_len - verify_width) : default_first_w_pos;
+     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
+     const auto should_write = [=](int32_t position) {
+       if (position >= first_w_pos) return true;
+diff --git a/python/sglang/jit_kernel/dsv4/compress.py b/python/sglang/jit_kernel/dsv4/compress.py
+index 148e23a107f5..43552bcdc948 100644
+--- a/python/sglang/jit_kernel/dsv4/compress.py
++++ b/python/sglang/jit_kernel/dsv4/compress.py
+@@ -237,6 +237,7 @@ def generate(
+         ring_size: int,
+         num_q_tokens: int,
+         use_cuda_graph: bool = False,
++        verify_width: int = 0,
+     ) -> CompressorPrefillPlan:
+         is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
+         pin_buffer = torch.empty(
+@@ -264,7 +265,7 @@ def generate(
+             module = _jit_compress_plan_module()
+             fn = module.plan_prefill
+ 
+-        plan_c, plan_w = fn(
++        plan_args = (
+             req_pool_indices,
+             req_to_token,
+             full_to_state,
+@@ -275,8 +276,10 @@ def generate(
+             int(compress_ratio),
+             int(swa_page_size),
+             int(ring_size),
+-            bool(use_cuda_graph),
+         )
++        if not _is_xpu:
++            plan_args += (int(verify_width),)
++        plan_c, plan_w = fn(*plan_args, bool(use_cuda_graph))
+         return CompressorPrefillPlan(
+             compress_ratio,
+             torch.from_dlpack(plan_c) if not _is_xpu else plan_c,
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index 8820e95bfb94..ea0638b58b19 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -559,13 +559,14 @@ def __init__(
+         self.online_c128_mtp = OnlineC128MTPController(self)
+         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+         spec_alg = model_runner.spec_algorithm
+-        self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
++        self.is_dspark = spec_alg.is_dspark()
++        self.needs_cpu_seq_lens = not self.is_dspark and (
+             not _is_cuda
+             or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
+             or self.online_c128_mtp.enabled()
+         )
+ 
+-        self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
++        self.is_dspark_draft = model_runner.is_draft_worker and self.is_dspark
+         self.is_draft_runner = model_runner.is_draft_worker
+         self.cuda_graph_custom_mask = None
+ 
+@@ -713,6 +714,7 @@ def init_forward_metadata_prefill(
+         use_prefill_cuda_graph: bool = False,
+         online_c128_state_slot_offset: int = 0,
+         dspark_block_size: Optional[int] = None,
++        verify_width: int = 0,
+     ) -> DSV4Metadata:
+         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
+             num_tokens=num_tokens,
+@@ -766,6 +768,7 @@ def create(compress_ratio: Literal[4, 128]):
+                         extend_lens_cpu=None,
+                         use_prefill_cuda_graph=True,
+                         num_q_tokens=out_cache_loc.shape[0],
++                        verify_width=verify_width,
+                         online_state_slot_offset=online_c128_state_slot_offset,
+                     )
+                 return create_paged_compressor_data(
+@@ -779,6 +782,7 @@ def create(compress_ratio: Literal[4, 128]):
+                     extend_lens=extend_seq_lens,
+                     extend_lens_cpu=extend_seq_lens_cpu,
+                     use_prefill_cuda_graph=use_graph_plan,
++                    verify_width=verify_width,
+                     online_state_slot_offset=online_c128_state_slot_offset,
+                 )
+ 
+@@ -904,6 +908,7 @@ def init_forward_metadata_target_verify_old(
+             need_compress=True,
+             use_prefill_cuda_graph=use_prefill_cuda_graph,
+             online_c128_state_slot_offset=online_c128_state_slot_offset,
++            verify_width=(self.speculative_num_draft_tokens if self.is_dspark else 0),
+         )
+ 
+     def init_forward_metadata_dspark_draft_block(
+@@ -1000,6 +1005,7 @@ def make_forward_metadata_from_raw_verify(
+             extend_lens_cpu=None,
+             use_prefill_cuda_graph=True,
+             num_q_tokens=num_q_tokens,
++            verify_width=(self.speculative_num_draft_tokens if self.is_dspark else 0),
+             online_state_slot_offset=online_c128_state_slot_offset,
+         )
+         c128_compress_metadata = raw_metadata.c128_compress_metadata
+diff --git a/python/sglang/srt/layers/attention/dsv4/compressor_v2.py b/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+index c70843a48b0a..33af7f180d9c 100644
+--- a/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
++++ b/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+@@ -413,6 +413,7 @@ def create_paged_compressor_data(
+     extend_lens_cpu: Optional[List[int]] = None,
+     use_prefill_cuda_graph: bool = False,
+     num_q_tokens: Optional[int] = None,
++    verify_width: int = 0,
+     online_state_slot_offset: int = 0,
+ ) -> CompressMetadata:
+     """Build the paged compress metadata (= the plan).
+@@ -464,6 +465,7 @@ def create_paged_compressor_data(
+             swa_page_size=swa_page_size,
+             ring_size=ring_size,
+             num_q_tokens=num_q_tokens,
++            verify_width=verify_width,
+             use_cuda_graph=use_prefill_cuda_graph,
+         )
+     else:

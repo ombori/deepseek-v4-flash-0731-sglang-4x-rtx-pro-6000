@@ -1,0 +1,26 @@
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_draft.py b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+index acdbd7451340..f59a51937e56 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_draft.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_draft.py
+@@ -16,6 +16,7 @@
+     CaptureHiddenMode,
+     ForwardBatch,
+     ForwardMode,
++    enable_num_token_non_padded,
+ )
+ from sglang.srt.runtime_context import get_parallel
+ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+@@ -436,6 +437,13 @@ def _fill_dp_moe_sync_metadata(
+             batch.global_num_tokens_for_logprob,
+         )
+         device = self.draft_model_runner.device
++        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
++        num_tokens = forward_batch.input_ids.numel()
++        if enable_num_token_non_padded():
++            forward_batch.num_token_non_padded = torch.tensor(
++                num_tokens, dtype=torch.int32, device=device
++            )
++        forward_batch.num_token_non_padded_cpu = num_tokens
+         forward_batch.global_num_tokens_cpu = gnt
+         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
+         forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
