@@ -4,7 +4,7 @@ Reproducible SGLang serving recipe for
 [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
 (284B MoE / 13B active, native FP4+FP8 checkpoint, 1M context) on **four**
 RTX PRO 6000 Blackwell GPUs: TP4 / DP4 (attention) / EP4 (MoE), DSPARK
-speculative decoding at draft depth 3, fp8 KV cache.
+speculative decoding at draft depth 4, fp8 KV cache.
 
 Stock sglang v0.5.16 (the latest release as of 2026-08-05) cannot serve this
 config: DSPARK crash-loops at warmup on SM120, several DSPARK-verify and
@@ -16,6 +16,83 @@ build, the serving config, measured numbers, and the failure boundaries.
 Existing public recipes for this model target 2× GPU / TP=2 (see
 [Related work](#related-work)). This one is the 4× / TP=4 / DP-attention
 shape.
+
+## Run the prebuilt image
+
+The image built from this repo is published to GitHub Container Registry.
+It is the exact build the numbers under
+[Measured performance](#measured-performance) were measured on. `:latest`
+tracks `main`; date tags (e.g. `:2026-08-06`) pin a specific build.
+
+```sh
+docker pull ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest
+```
+
+The model weights are **not** in the image. Download the ~158 GB
+DeepSeek-V4-Flash-0731 checkpoint separately and mount it read-only; the
+commands below assume it sits at `/models/DeepSeek-V4-Flash-0731` on the
+host:
+
+```sh
+hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
+    --local-dir /models/DeepSeek-V4-Flash-0731
+```
+
+Minimal `docker run` with the validated serving shape (TP4/DP4/EP4, DSPARK
+γ=4, fp8 KV, indexer threshold). The flags mirror
+[`docker-compose.example.yml`](./docker-compose.example.yml) — that file is
+canonical if the two ever differ, and it documents *why* each flag is set:
+
+```sh
+docker run -d --name sglang \
+  --gpus '"device=0,1,2,3"' --ipc=host --shm-size 32g \
+  -p 8000:30000 \
+  -v /models:/models:ro \
+  -v "$PWD/sglang-cache:/root/.cache" \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS=1024 \
+  --entrypoint python3 \
+  ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest \
+  -m sglang.launch_server \
+  --model-path /models/DeepSeek-V4-Flash-0731 \
+  --served-model-name deepseek-v4-flash \
+  --host 0.0.0.0 --port 30000 \
+  --tp-size 4 --dp-size 4 --enable-dp-attention --enable-dp-lm-head \
+  --ep-size 4 \
+  --trust-remote-code \
+  --mem-fraction-static 0.90 \
+  --context-length 1048576 \
+  --swa-full-tokens-ratio 0.1 \
+  --max-running-requests 256 --cuda-graph-max-bs 64 \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --speculative-algorithm DSPARK \
+  --speculative-attention-mode decode \
+  --speculative-dspark-block-size 4 \
+  --disable-custom-all-reduce \
+  --chunked-prefill-size 4096 \
+  --reasoning-parser deepseek-v4 \
+  --tool-call-parser deepseekv4 \
+  --enable-cache-report
+```
+
+For anything long-lived, prefer the compose file (adds healthcheck, restart
+policy, and the JIT-cache persistence notes). It references the local build
+tag, so retag the pulled image first:
+
+```sh
+docker tag ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest \
+    sglang:v0.5.16-dsv4-sm120
+docker compose -f docker-compose.example.yml up -d
+```
+
+First boot is slow (JIT kernel compile + flashinfer autotune, ~10–15 min);
+the compose healthcheck allows for it. The OpenAI-compatible API lands on
+`:8000`.
+
+Clients should send `temperature 1.0 / top_p 1.0` (DeepSeek's official
+calibration for this checkpoint — lower temperatures drive repetition
+loops).
 
 ## Hardware
 
@@ -31,7 +108,12 @@ latency (fewer PCIe hops); bs=1 decode is interconnect-latency bound, not
 bandwidth bound. EP4 helps bs=1 by shrinking the MoE all-reduce.
 `nvidia-smi topo -m` shows `NODE` for all pairs on this box.
 
-## Quickstart
+## Building the image yourself
+
+Equivalent to pulling the prebuilt image (the build is deterministic given
+the pinned base image + patch set). `.github/workflows/build-image.yml`
+automates build+push, but needs a self-hosted runner with ~100 GB free disk
+— the ~46 GB image does not fit GitHub-hosted runners.
 
 ```sh
 git clone https://github.com/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000
@@ -41,14 +123,6 @@ docker build -t sglang:v0.5.16-dsv4-sm120 .
 # put the DeepSeek-V4-Flash-0731 checkpoint under /models, then:
 docker compose -f docker-compose.example.yml up -d
 ```
-
-First boot is slow (JIT kernel compile + flashinfer autotune, ~10–15 min);
-the compose healthcheck allows for it. The OpenAI-compatible API lands on
-`:8000`.
-
-Clients should send `temperature 1.0 / top_p 1.0` (DeepSeek's official
-calibration for this checkpoint — lower temperatures drive repetition
-loops).
 
 ## Measured performance
 
