@@ -1,5 +1,5 @@
 # DeepSeek-V4-Flash-0731 on 4x RTX PRO 6000 Blackwell (SM120), TP4/DP4/EP4,
-# DSPARK speculative decoding at draft depth 3. This is the exact serving
+# DSPARK speculative decoding at draft depth 4. This is the exact serving
 # shape the README benchmarks were measured on.
 #
 # Prerequisites:
