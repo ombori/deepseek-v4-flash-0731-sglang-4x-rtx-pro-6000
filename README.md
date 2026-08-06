@@ -20,7 +20,7 @@ The patch set now carries two additions past the published image: a backport of 
 
 The updated stack passed the same ship gate as the published image: 5 cold launches under the bursty repro protocol below, 0 corruption events across 11,187 requests, 8/8 streaming truncation probes complete.
 
-The prebuilt image tags do not include any of this yet; they refresh with the next pushed build. Until then, build from this repo — the compose file already assumes the new build, and the three new env vars abort at boot on the published `:latest` (its older DeepGEMM asserts on SM120), so don't retag the pulled image onto the updated compose.
+The prebuilt image now includes all of this: tags `:latest` and `:2026-08-06.2`, digest `sha256:b4f21873370080c5b996d38cb82d6005aae9c10e50cda644b2ecbf912b0029aa`. The previous image remains at `:2026-08-06` — note the new compose/env recipe aborts at boot on that older build (its DeepGEMM predates SM120 support), so keep compose and image in step.
 
 One thing the DeepGEMM bump does not unlock: its FP4 grouped MoE GEMM still fails on SM120 inside DeepGEMM's own warmup (CUDA 719 at DSv4 per-rank shapes), so the MoE runner stays `flashinfer_mxfp4` and the remaining piece of #29927's recipe waits on a DeepGEMM fix.
 
@@ -51,6 +51,9 @@ docker run -d --name sglang \
   -v "$PWD/sglang-cache:/root/.cache" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS=1024 \
+  -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=0 \
+  -e SGLANG_OPT_USE_TILELANG_INDEXER=0 \
+  -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=1 \
   --entrypoint python3 \
   ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest \
   -m sglang.launch_server \
@@ -60,7 +63,7 @@ docker run -d --name sglang \
   --tp-size 4 --dp-size 4 --enable-dp-attention --enable-dp-lm-head \
   --ep-size 4 \
   --trust-remote-code \
-  --mem-fraction-static 0.90 \
+  --mem-fraction-static 0.85 \
   --context-length 1048576 \
   --swa-full-tokens-ratio 0.1 \
   --max-running-requests 256 --cuda-graph-max-bs 64 \
