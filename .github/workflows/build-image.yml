@@ -48,10 +48,22 @@ jobs:
         run: |
           git clone --depth 1 --branch v0.5.16 https://github.com/sgl-project/sglang /tmp/sglang-check
           cd /tmp/sglang-check
+          # Apply in the Dockerfile's order — patches have inter-hunk
+          # dependencies (e.g. dsv4-streaming-preamble-fix.diff needs the
+          # pr32332/pr32167/pr31009 detector hunks in place first), so glob
+          # order does not work. The Dockerfile is the single source of truth.
+          mapfile -t ORDER < <(grep -oE '/tmp/patches/[A-Za-z0-9._-]+\.diff' "$GITHUB_WORKSPACE"/Dockerfile | sed 's|/tmp/patches/||')
+          [ "${#ORDER[@]}" -gt 0 ] || { echo "no patch order parsed from Dockerfile"; exit 1; }
           for p in "$GITHUB_WORKSPACE"/patches/*.diff; do
+            printf '%s\n' "${ORDER[@]}" | grep -qx "$(basename "$p")" \
+              || { echo "NOT LISTED IN DOCKERFILE: $p"; exit 1; }
+          done
+          for name in "${ORDER[@]}"; do
+            p="$GITHUB_WORKSPACE/patches/$name"
+            [ -f "$p" ] || { echo "LISTED BUT MISSING: $name"; exit 1; }
             git apply --check "$p" && git apply "$p" || { echo "FAILED: $p"; exit 1; }
           done
-          echo "all patches apply"
+          echo "all ${#ORDER[@]} patches apply (Dockerfile order)"
 
       # ---- build (the Dockerfile re-applies patches and runs the -------
       # ---- in-image ast-parse gate over every patched file) ------------
