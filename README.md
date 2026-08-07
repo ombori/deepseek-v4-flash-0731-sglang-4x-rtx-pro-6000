@@ -1,8 +1,8 @@
 # DeepSeek-V4-Flash-0731 on 4× RTX PRO 6000 Blackwell (SM120) — SGLang recipe
 
-This is the config we run in production: [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) (284B MoE / 13B active, native FP4+FP8, 1M context) on four RTX PRO 6000 Blackwell cards. TP4, DP4 attention, EP4, DSPARK speculative decoding at draft depth 4, fp8 KV cache.
+This is the config we run in production: [DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) (284B MoE / 13B active, native FP4+FP8, 1M context) on four RTX PRO 6000 Blackwell cards. TP4, DP4 attention, EP4, DSPARK speculative decoding at draft depth 7 with the shipped SPS cost table and compact ragged verify, fp8 KV cache.
 
-Stock sglang v0.5.16 can't serve this. DSPARK crash-loops at warmup on SM120, several verify and tool-call-streaming bugs bite under real traffic, and the checkpoint's default speculative draft depth silently corrupts output (that last one also affects upstream `main`, details below). This repo has the patch set, the image build, the serving config, the measured numbers, and the failure boundaries we mapped so you don't have to.
+Stock sglang v0.5.16 can't serve this. DSPARK crash-loops at warmup on SM120, several verify and tool-call-streaming bugs bite under real traffic, and the checkpoint's default speculative draft depth silently corrupted output until we root-caused it to an SM120 allocation bug (it also affects upstream `main`; fixed in this patch set, details below). This repo has the patch set, the image build, the serving config, the measured numbers, and the failure boundaries we mapped so you don't have to.
 
 Everything was measured on exactly this rig, but parts of it travel further than the name suggests: the patches apply to any SM120 card count, the draft-depth corruption affects any DSpark deployment on any engine, and the dependency pins hold for Blackwell workstation cards generally. See [What here generalizes](#what-here-generalizes).
 
@@ -10,9 +10,35 @@ The existing public recipes for this model target 2× GPU / TP=2 (see [Related w
 
 ## What this recipe optimizes for
 
-High-concurrency agentic serving: many parallel sessions, tool calling, long contexts. That objective drove the biggest layout choice here — DP attention gives ~4x the KV capacity (MLA's KV cannot be sharded under plain TP, so every added replica of it multiplies concurrent context) and the aggregate numbers below, at a deliberate cost to single-stream latency. On this config we measure ~2,300-2,400 out tok/s at 64 concurrent and 78-98 tok/s at batch size 1.
+High-concurrency agentic serving: many parallel sessions, tool calling, long contexts. That objective drove the biggest layout choice here — DP attention gives ~4x the KV capacity (MLA's KV cannot be sharded under plain TP, so every added replica of it multiplies concurrent context) and the aggregate numbers below, at a deliberate cost to single-stream latency. On this config we measure ~2,200 out tok/s at 64 concurrent and 102-112 tok/s at batch size 1 on real prose (the gamma-7 + SPS-table config in the 2026-08-07 update closed most of the old bs=1 gap).
 
-If your workload is a single interactive stream, there is real headroom on this hardware that this recipe leaves on the table. Our own non-DP TP4 runs measured ~90-98 tok/s at bs=1, TP=2 does better still per stream (fewer PCIe hops; bs=1 decode on these boxes is interconnect-latency bound, not bandwidth bound), and layer-split runtimes avoid the per-layer TP synchronization entirely — llama.cpp with the official GGUF and an MTP draft reaches 100-130 tok/s on two of these cards at 512K context. Each of those trades away something this recipe keeps: concurrency, the full 1M context, or the native-precision checkpoint. Pick the shape that matches your traffic; the numbers in this README only claim to be optimal for ours.
+If your workload is a single interactive stream, other shapes still have something to offer. TP=2 does better per stream (fewer PCIe hops; bs=1 decode on these boxes is interconnect-latency bound, not bandwidth bound), and layer-split runtimes avoid the per-layer TP synchronization entirely — llama.cpp with the official GGUF and an MTP draft reaches 100-130 tok/s on two of these cards at 512K context. Each of those trades away something this recipe keeps: concurrency, the full 1M context, or the native-precision checkpoint. Pick the shape that matches your traffic; the numbers in this README only claim to be optimal for ours.
+
+## 2026-08-07 update: depth-5 root cause fixed, gamma 7, structured outputs
+
+Nine patches join the set (rows at the bottom of the [patch table](#patches)) and the serving shape changes. The headline: the draft-depth-5 corruption is root-caused and fixed, so draft depth stopped being a safety constraint and became a throughput knob. We now run depth 7 (DeepSeek's recipe value) with a profiled SPS cost table under compact ragged verify — the confidence-scheduled verify path that was listed as rejected in earlier revisions of this README.
+
+What the new patches add, beyond the depth fix:
+
+- Structured outputs (`json_schema` / `regex` / `ebnf` / `structural_tag`, and `tool_choice: required`) now work under speculative decoding — previously HTTP 400. Grammar requests de-fold the accept epilogue for their batch, a modest per-batch cost; traffic without grammars is unaffected.
+- Long generations no longer hit a ~280K-token single-request ceiling: SWA KV was never evicted on the spec path (#33805). Validated with a 309K-token single generation.
+- Tool-schema prompt encoding now byte-matches the checkpoint's reference encoder (#33568) — pydantic serialization was leaking unset defaults like `strict: false` into the rendered prompt.
+- DP dispatch learned routing-key affinity (#31170): keyed multi-turn conversations pin to the DP rank holding their radix-cache prefix. With a prefill delayer (#31835/#32880) holding large prefills while small requests queue, resume storms stopped starving interactive traffic.
+
+Measured 2026-08-07 on this config, real prompts at bs=1: 102-112 tok/s on prose, 141-184 on content-heavy generations (code, tables — draft accepts run higher there). Aggregate: 1,276 out tok/s at conc16, 2,227 at conc64. The composed gamma-7 config trades ~7% of conc64 throughput against gamma-4 for +25% at bs=1 — we take that trade for interactive agent traffic; run depth 4 without the SPS table if aggregate is all you care about. Multi-hundred-K-token session resumes prefill at 4.1K tok/s cold, and we see radix prefix-cache hits up to 569K tokens on resume with the affinity dispatch.
+
+### Regenerating the SPS table
+
+`sps/dspark_sps_g7.json` is the gamma-7 SPS additive cost table the compose file mounts; compact verify uses it to price verify-row counts. It was profiled at this exact TP4/DP4 topology and depth. If you change the draft depth, card count, or parallel layout, regenerate: boot the server with `SGLANG_DSPARK_ENABLE_SPS_RECORD=1`, `SGLANG_RAGGED_VERIFY_MODE=compact` and `SGLANG_SIMULATE_ACC_LEN=1.0`, then run
+
+```sh
+python -m sglang.benchmark.dspark_sps_profiler all \
+    --base-url http://localhost:8000 \
+    --fracs 0.125 0.25 0.375 0.5 0.625 0.75 0.875 1.0 \
+    --batch-size 1 2 4 8 16 24 32 40 48 56 64
+```
+
+and point `--speculative-dspark-sps-table-path` at the emitted JSON.
 
 ## 2026-08-06 update: faster prefill
 
@@ -26,7 +52,7 @@ The patch set now carries two additions past the published image: a backport of 
 
 The updated stack passed the same ship gate as the published image: 5 cold launches under the bursty repro protocol below, 0 corruption events across 11,187 requests, 8/8 streaming truncation probes complete.
 
-The prebuilt image now includes all of this: tags `:latest` and `:2026-08-06.2`, digest `sha256:b4f21873370080c5b996d38cb82d6005aae9c10e50cda644b2ecbf912b0029aa`. The previous image remains at `:2026-08-06` — note the new compose/env recipe aborts at boot on that older build (its DeepGEMM predates SM120 support), so keep compose and image in step.
+This shipped as tag `:2026-08-06.2`, digest `sha256:b4f21873370080c5b996d38cb82d6005aae9c10e50cda644b2ecbf912b0029aa` (`:latest` has since moved on to the 2026-08-07 stack). The 2026-08-06 image remains at `:2026-08-06` — note the compose/env recipe from this update on aborts at boot on that older build (its DeepGEMM predates SM120 support), so keep compose and image in step.
 
 One thing the DeepGEMM bump does not unlock: its FP4 grouped MoE GEMM still fails on SM120 inside DeepGEMM's own warmup (CUDA 719 at DSv4 per-rank shapes), so the MoE runner stays `flashinfer_mxfp4` and the remaining piece of #29927's recipe waits on a DeepGEMM fix.
 
@@ -38,7 +64,7 @@ The image is public, so there's no build step:
 docker pull ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest
 ```
 
-`:latest` tracks `main`; date tags (e.g. `:2026-08-06`) pin a specific build. It's the exact build the numbers under [Measured performance](#measured-performance) came from.
+`:latest` tracks `main`; date tags (e.g. `:2026-08-06`) pin a specific build. It's the exact build the [2026-08-07 update](#2026-08-07-update-depth-5-root-cause-fixed-gamma-7-structured-outputs) numbers came from; older benchmark sections below state the shape they were measured at.
 
 The weights are not in the image. Download the ~158 GB checkpoint and mount it read-only; the commands below assume `/models/DeepSeek-V4-Flash-0731` on the host:
 
@@ -47,7 +73,7 @@ hf download deepseek-ai/DeepSeek-V4-Flash-0731 \
     --local-dir /models/DeepSeek-V4-Flash-0731
 ```
 
-Minimal `docker run` with the validated shape. The flags mirror [`docker-compose.example.yml`](./docker-compose.example.yml); that file is canonical if the two ever differ, and it documents why each flag is set:
+Minimal `docker run` with the validated shape. The flags mirror [`docker-compose.example.yml`](./docker-compose.example.yml); that file is canonical if the two ever differ, and it documents why each flag is set. One file comes from the repo rather than the image: the SPS cost table (`sps/dspark_sps_g7.json`) — clone the repo or fetch that file before running:
 
 ```sh
 docker run -d --name sglang \
@@ -55,11 +81,13 @@ docker run -d --name sglang \
   -p 8000:30000 \
   -v /models:/models:ro \
   -v "$PWD/sglang-cache:/root/.cache" \
+  -v "$PWD/sps:/sps:ro" \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS=1024 \
   -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=0 \
   -e SGLANG_OPT_USE_TILELANG_INDEXER=0 \
   -e SGLANG_OPT_DEEPGEMM_HC_PRENORM=1 \
+  -e SGLANG_RAGGED_VERIFY_MODE=compact \
   --entrypoint python3 \
   ghcr.io/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000:latest \
   -m sglang.launch_server \
@@ -77,12 +105,20 @@ docker run -d --name sglang \
   --moe-runner-backend flashinfer_mxfp4 \
   --speculative-algorithm DSPARK \
   --speculative-attention-mode decode \
-  --speculative-dspark-block-size 4 \
+  --speculative-dspark-block-size 7 \
+  --speculative-dspark-sps-table-path /sps/dspark_sps_g7.json \
   --disable-custom-all-reduce \
   --chunked-prefill-size 4096 \
   --reasoning-parser deepseek-v4 \
   --tool-call-parser deepseekv4 \
-  --enable-cache-report
+  --enable-cache-report \
+  --default-chat-template-kwargs '{"thinking": true}' \
+  --load-balance-method prefix_affinity \
+  --prefix-affinity-disable-token-fallback \
+  --prefix-affinity-fallback round_robin \
+  --enable-prefill-delayer \
+  --prefill-delayer-max-delay-passes 8 \
+  --prefill-delayer-token-usage-low-watermark 0.5
 ```
 
 For anything long-lived, use the compose file instead (healthcheck, restart policy, JIT-cache persistence notes). It references the local build tag, so retag the pulled image first:
@@ -123,7 +159,7 @@ docker compose -f docker-compose.example.yml up -d
 
 ## Measured performance
 
-`sglang.bench_serving`, random 1024-in / 512-out, measured 2026-08-05 on the exact image and compose in this repo (only the `--speculative-*` flags removed for the no-spec column). Numbers are output tok/s. The [concurrency sweep](#concurrency-and-operating-points) below is a later run of the same config, so its absolute figures differ by a few percent (run-to-run variance on a thermally soaked box); use the sweep for scaling shape and this table for spec-vs-no-spec.
+`sglang.bench_serving`, random 1024-in / 512-out, measured 2026-08-05 at the γ=4 static-verify shape this repo shipped then (only the `--speculative-*` flags removed for the no-spec column); the [2026-08-07 update](#2026-08-07-update-depth-5-root-cause-fixed-gamma-7-structured-outputs) has the current γ=7 numbers. Numbers are output tok/s. The [concurrency sweep](#concurrency-and-operating-points) below is a later run of the same config, so its absolute figures differ by a few percent (run-to-run variance on a thermally soaked box); use the sweep for scaling shape and this table for spec-vs-no-spec.
 
 | workload | no spec | DSPARK γ=4 | Δ |
 |---|---|---|---|
@@ -135,7 +171,7 @@ docker compose -f docker-compose.example.yml up -d
 
 One caveat you should not skip: synthetic prompts flatter spec decode. Random-token prompts drive the model into highly predictable continuations, which DSPARK predicts almost perfectly. We measured accept length 4.4–4.7 of 5 draft tokens on random prompts versus ~2.1 on real prose, so treat the decode-bound figures above as roughly 2× optimistic for real agentic traffic. The bs=1 essay-prompt measurement (~85 tok/s) is the more honest single-stream number.
 
-Accept length at γ=4 is 2.0–2.2 of 5 verify rows on real text, and it stays ~2.2 at every depth we tested (3, 4, 6, 7). The draft head realises about the same number of tokens regardless of window, so wider windows only dilute the accept rate and cost bs=1 latency. γ=4 measured best at bs=1 with aggregate within ~4% of the widest window.
+Accept length at γ=4 is 2.0–2.2 of 5 verify rows on real text, and it stays ~2.2 at every depth we tested (3, 4, 6, 7). The draft head realises about the same number of tokens regardless of window, so under static verify-all wider windows only dilute the accept rate and cost bs=1 latency — γ=4 measured best at bs=1 there, with aggregate within ~4% of the widest window. Compact verify changes that calculus: with the SPS table pricing verify rows, γ=7 wins bs=1 by +25% over γ=4 at a ~7% conc64 cost (see the 2026-08-07 update), which is why the shipped config now runs 7.
 
 Prefill runs ~5.4K tok/s at 90K ctx and stays roughly flat to large context with the indexer-threshold env set (see the compose file). Without it, prefill decays to ~2K tok/s at large context because every DP prefill chunk falls back to a paged-gather kernel.
 
@@ -163,17 +199,19 @@ Long context moves the knee. At 8192-in / 512-out the regime flips to prefill-bo
 
 | # | issue | status / workaround |
 |---|---|---|
-| 1 | **DSPARK draft depth γ=5 corrupts output on SM120 — and only γ=5.** At γ=5 generations garble under real load: token loops (`` ` for ` for ` for `` …), word salad, `</think>` leaking into content, and a broken spec-decode greedy invariant (temp-0 with spec ≠ temp-0 without, same image/shape). γ=3, 4, 6 and 7 are all clean under the same protocol — the fault is **not** depth-monotonic. γ=5 is exactly the checkpoint's native `dspark_block_size`, and it corrupts whether it is set explicitly or inferred. Reproduced on patched v0.5.16 **and** on upstream `main` @ `211ee642` (2026-08-05). Filed upstream as [sglang#33800](https://github.com/sgl-project/sglang/issues/33800). Full sweep + repro protocol below. | run an explicit `--speculative-dspark-block-size 4` (this repo's compose). **Never omit the flag** — omitting it infers γ=5 from the checkpoint, i.e. the one broken value |
+| 1 | **DSPARK draft depth γ=5 corrupted output on SM120 — root-caused, fixed in this image.** At γ=5 generations garbled under real load: token loops, word salad, `</think>` leaking into content, a broken spec-decode greedy invariant. Root cause (found 2026-08-07): the SM120 mHC combine fallback ran a reduction inside the NCCL symmetric-memory context, so its transients intermittently aliased in-flight collective buffers — an allocation-context bug, not arithmetic, which is why it was shape-dependent and stochastic per launch. The #29927 hc_combine kernel carried in this stack replaces that fallback and fixes it; draft depth is now a throughput choice, and this recipe runs 7 (DeepSeek's recipe value). Investigation trail: [sglang#33800](https://github.com/sgl-project/sglang/issues/33800). Measured on SM120; other archs may differ. Full history + repro protocol below. | fixed here (hc_combine via `pr29927-notest.diff`). On stock v0.5.16 or upstream `main` without it, γ=5 — the value inferred when the flag is omitted — still corrupts: pin a different depth there |
 | 1b | **Assistant prose is truncated mid-sentence when a tool call follows (streaming only).** The DeepSeek streaming detector drops normal text that shares a delta with the DSML tool-call opener; speculative decoding makes multi-token deltas common, so it fires often. Measured on the unpatched image with a preamble-forcing prompt: **4/8 streaming responses cut mid-sentence** (sometimes empty), while non-streaming was 8/8 complete. | fixed by `dsv4-streaming-preamble-fix.diff` in this repo (extends upstream [#31786](https://github.com/sgl-project/sglang/pull/31786) to every DSML marker form): **0/8 cut** |
 | 2 | **flashinfer must be exactly 0.6.15.post1** on this base. 0.6.16.post1 segfaults v0.5.16 CUDA-graph capture on SM120 (tested). | pinned in the Dockerfile |
-| 3 | **Grammar-constrained decoding is unsupported under DSPARK**: `tool_choice: required` / strict `json_schema` return HTTP 400. | use `tool_choice: auto` (unaffected). Upstream is adding grammar+DSPARK on `main` (#31753) |
+| 3 | **Grammar-constrained decoding under DSPARK — fixed in this image.** Stock v0.5.16 returns HTTP 400 for `tool_choice: required` / strict `json_schema` with spec decode on. | fixed by `pr30096-family-notest.diff`: `json_schema`, `regex`, `ebnf` and `structural_tag` all work under DSPARK. Grammar requests de-fold the accept epilogue for their batch (modest per-batch cost); requests without grammars are unaffected |
 | 4 | **`repetition_penalty` is silently ignored under DSPARK verify**, even with #33531 applied — that PR restores only the *additive* penalties; the multiplicative penalizer rides a dense-fallback branch that overlap mode skips. Verified: `repetition_penalty 1.3` stops a repetition probe with spec off, does nothing with spec on. | use `frequency_penalty` / `presence_penalty` — dose-responsive under verify with #33531 applied (0.25–0.3 works; normal prompts stay coherent) |
 | 5 | **MoE runner must be `flashinfer_mxfp4`** for this checkpoint on SM120: default triton runner crashes ("Hidden size mismatch"), `flashinfer_trtllm` corrupts FP4 output (sglang#26324). | pinned in the compose |
 | 6 | **Custom all-reduce fails CUDA-graph capture** on PCIe GPU pairs (sglang#11957 class). | `--disable-custom-all-reduce` |
 
-Levers we tried and rejected, so you don't re-try them on this hardware: `--enable-flashinfer-allreduce-fusion` (SM90/SM10x only, crashes), `--enable-quant-communications` (NPU only), `--enable-torch-symm-mem` ("Device capability 12 not supported"), NCCL P2P via IOMMU (engages but net-negative for decode latency here), `SGLANG_RAGGED_VERIFY_MODE=compact` (pre-#32467 it IMAs at graph capture; with #32467 it captures, but the depth-gated corruption above is independent of verify mode, so this recipe serves `static`).
+Levers we tried and rejected, so you don't re-try them on this hardware: `--enable-flashinfer-allreduce-fusion` (SM90/SM10x only, crashes), `--enable-quant-communications` (NPU only), `--enable-torch-symm-mem` ("Device capability 12 not supported"), NCCL P2P via IOMMU (engages but net-negative for decode latency here). One earlier rejection has graduated: `SGLANG_RAGGED_VERIFY_MODE=compact` (pre-#32467 it IMAs at graph capture) is now what this recipe serves — with #32467 plus the `dsv4-compact-gamma-runtime` patch it is capture-safe at every depth we run, and it is what makes the SPS table do anything.
 
 ## The draft-depth corruption boundary (issue 1, in full)
+
+Resolved 2026-08-07 — see Known issues #1 for the root cause (mHC combine fallback allocating its reduction transients inside the NCCL symmetric-memory context) and [sglang#33800](https://github.com/sgl-project/sglang/issues/33800) for the investigation. Everything below is the measurement record that got there, kept because the repro protocol transfers to any stochastic spec-decode corruption hunt, and because the boundary map is what falsified every cheaper hypothesis.
 
 Spec decode is supposed to be distribution-preserving, so any temp-0 divergence between spec-on and spec-off is a verify-path mis-commit, not a sampling artifact. What we measured, all on this hardware:
 
@@ -190,7 +228,7 @@ Spec decode is supposed to be distribution-preserving, so any temp-0 divergence 
 
 The γ=3 and γ=4 rows are 5-cold-launch arms; γ=5/6/7 are single-launch screens of the same 4-phase load (~2.1–2.3K req), where the γ=5 control produced 10 events. A zero there is a strong signal, not a small-sample artifact.
 
-γ=5 is the checkpoint's native block size and its immediate neighbours are clean, so the most likely explanation is a native-block-size specialised path (kernel instantiation or planner fast path selected when the requested block size equals the head's trained size) being wrong on SM120. Not a capacity, window, or ring bound. We ruled those out by measurement, not argument: c4 compress-state ring capacity (doubling it changed nothing, 32 events / 10,209 req), verify window vs compress ratio (γ=4 and 6 cross the same boundaries and are clean), NaN logits, KV-store padding, the #32277 sentinel clamp, CUTLASS-vs-Triton attention dispatch, and the config inference path (explicit γ=5 is equally dirty).
+Our working hypothesis at the time — a native-block-size specialised path, since γ=5 is the checkpoint's native block size and its immediate neighbours were clean — turned out wrong: the confirmed mechanism is the mHC combine fallback's transient allocation landing in the NCCL symmetric-memory pool, where whether it aliases an in-flight collective buffer depends on allocation timing and shape, and γ=5's shapes happened to line up. A useful reminder that a razor-sharp reproduction boundary does not imply a specialised code path. It was at least not a capacity, window, or ring bound — we ruled those out by measurement, not argument: c4 compress-state ring capacity (doubling it changed nothing, 32 events / 10,209 req), verify window vs compress ratio (γ=4 and 6 cross the same boundaries and are clean), NaN logits, KV-store padding, the #32277 sentinel clamp, CUTLASS-vs-Triton attention dispatch, and the config inference path (explicit γ=5 is equally dirty).
 
 Supporting evidence:
 
@@ -229,18 +267,27 @@ All patches apply to `lmsysorg/sglang:v0.5.16-cu130-runtime`. `prNNNNN-notest.di
 | `pr33531-notest.diff` | [#33531](https://github.com/sgl-project/sglang/pull/33531) OPEN | verify path reads a renamed-away attr → ALL sampling penalties silently dead under spec decode on stock v0.5.16. Restores the additive ones (frequency/presence/min_new_tokens); hunks re-derived for v0.5.16. The multiplicative gap remains (known issue 4) |
 | `pr32277-notest.diff` | [#32277](https://github.com/sgl-project/sglang/pull/32277) MERGED | clamps all-sentinel DSpark draft rows to token 0 in `_online_combine_kernel` (they otherwise emit an out-of-range token id into verify), plus NaN guards in the reject-sampling path. Measured **not** to fix known issue 1, kept as correctness hardening |
 | `pr31017-notest.diff` | [#31017](https://github.com/sgl-project/sglang/pull/31017) MERGED | MoE top-k renormalization epsilon for degenerate rows |
-| `pr29927-notest.diff` | [#29927](https://github.com/sgl-project/sglang/pull/29927) OPEN | the SM120 prefill stack: batched sparse-MLA prefill for >64-row calls, chunked indexer metadata, u64-lane page-split, HC-prenorm dispatch, and the env switches the compose file enables (which also need the Dockerfile's sgl-deep-gemm bump). This backport gates the >64-row route on `topk == 512`: ungated, DSPARK's draft indexer (topk=192) lands in the prefill kernel and crash-loops the boot — upstream can't see this because `main` can't boot DSPARK on SM120 without #33407. Details in the diff header |
+| `pr29927-notest.diff` | [#29927](https://github.com/sgl-project/sglang/pull/29927) OPEN | the SM120 prefill stack: batched sparse-MLA prefill for >64-row calls, chunked indexer metadata, u64-lane page-split, HC-prenorm dispatch, and the env switches the compose file enables (which also need the Dockerfile's sgl-deep-gemm bump). This backport gates the >64-row route on `topk == 512`: ungated, DSPARK's draft indexer (topk=192) lands in the prefill kernel and crash-loops the boot — upstream can't see this because `main` can't boot DSPARK on SM120 without #33407. Also the carrier of the Triton `hc_combine` kernel that fixes known issue 1 (the mHC combine fallback it replaces was the corruption source). Details in the diff header |
+| `pr31170-notest.diff` | [#31170](https://github.com/sgl-project/sglang/pull/31170) OPEN | `prefix_affinity` DP load-balance method: requests keyed by the `x-smg-routing-key` header map to the rendezvous-(HRW-)hashed live rank so multi-turn conversations hit their radix-cache prefix, with a load-skew overload guard; keyless traffic defers to the configured fallback. server_args hunks re-derived for v0.5.16 |
+| `pr31835-notest.diff` | [#31835](https://github.com/sgl-project/sglang/pull/31835) MERGED 2026-07-21 (missed the v0.5.16 branch point) | PrefillDelayer negotiates only after the KV-budget admission checks, and mid-chunk ranks report prefillable — the old placement made storms read "mixed" and hold queued small requests |
+| `pr32880-notest.diff` | [#32880](https://github.com/sgl-project/sglang/pull/32880) MERGED 2026-08-03 | delayer "all"-branch delay bounded by `max_delay_passes` (saturated engines could delay forever); the `max_prefill_bs` high-watermark decays 0.998/pass instead of ratcheting for the process lifetime. scheduler.py hunks re-anchored for v0.5.16 |
+| `pr27199-notest.diff` | [#27199](https://github.com/sgl-project/sglang/pull/27199) OPEN | `GenerateReqInput.__getitem__`'s field allowlist dropped `routing_key` / `require_reasoning` when n>1 batches are sliced — companion correctness fix for the affinity dispatch |
+| `dsv4-compact-gamma-runtime.diff` | ours — not yet filed | the compact-verify confidence path viewed draft tensors by the checkpoint-native gamma instead of the runtime draft window, so any configured `--speculative-dspark-block-size` != native failed decode-graph capture with a shape error; derives the window from the tensor. Prerequisite for running depth 7 under compact |
+| `pr33805-notest.diff` | [#33805](https://github.com/sgl-project/sglang/pull/33805) OPEN (ormandj) | SWA KV eviction (and the `decode_batch_idx` tick that gates it) never ran on the dflash-family spec path, so hybrid-SWA models kept SWA KV for every generated token: ~280K single-request generation ceiling on our pools, then retraction livelock under concurrent long generations. Hunk re-anchored for v0.5.16 |
+| `pr33568-notest.diff` | [#33568](https://github.com/sgl-project/sglang/pull/33568) OPEN | tool schemas were rendered into the prompt with pydantic-default noise (`strict: false` etc.); `exclude_unset` + `by_alias` serialization makes the encoding byte-match the checkpoint's reference encoder |
+| `pr32686-notest.diff` | [#32686](https://github.com/sgl-project/sglang/pull/32686) OPEN | DeepGEMM JIT warmup could size its probe GEMMs past the free-memory budget (the reducer had a hard 4096-M floor and no skip path); picks the largest M within budget, or skips the shape with a warning |
+| `pr30096-family-notest.diff` | [#30096](https://github.com/sgl-project/sglang/pull/30096) + [#32393](https://github.com/sgl-project/sglang/pull/32393) + [#32409](https://github.com/sgl-project/sglang/pull/32409), all MERGED, consolidated + re-anchored to v0.5.16 | grammar-constrained decoding (`json_schema` / `regex` / `ebnf` / `structural_tag`) under DSPARK/DFLASH spec: grammar requests de-fold the accept epilogue for their batch and apply vocab masks across verify rows. Fixes known issue 3 |
 
-The two patches from the 2026-08-06 update are ahead of the published image tags; everything else is exactly the image the numbers above were measured on. Retire each backport when it lands in an sglang release. The stack also rebases cleanly onto upstream `main` (three of the diffs drop as merged, the flashinfer pin becomes upstream's own), but note that `main` does not fix known issue 1.
+Everything in this table, including the nine 2026-08-07 rows, is in the published image. Retire each backport when it lands in an sglang release. The stack also rebases onto upstream `main` (the merged diffs drop, the flashinfer pin becomes upstream's own), but note that `main` still lacks #29927's hc_combine, so known issue 1 is live there.
 
 ## What here generalizes
 
 The name promises one exact rig. These parts don't need it:
 
-- **The draft-depth corruption (issue 1)** is a property of the DSpark draft head, not of this card count or this engine. If you run DSpark anywhere, vLLM included, and your stack infers the draft depth from the checkpoint, you are at depth 5, the one value we measured as broken. Independent reports match on other hardware ([sglang#32666](https://github.com/sgl-project/sglang/issues/32666), and the same phenotype under vLLM on the same GPUs in [rtx6kpro#53](https://github.com/local-inference-lab/rtx6kpro/issues/53)). Test your own depth before trusting any of us.
+- **The draft-depth corruption (issue 1)** is fixed in this image, but the vulnerable pattern — a large transient allocated inside a symmetric-memory / collective-buffer context — is not specific to this card count, and any stack without the fix that infers the draft depth from the checkpoint sits at depth 5, the value we measured as broken. Independent reports match on other hardware ([sglang#32666](https://github.com/sgl-project/sglang/issues/32666), and the same phenotype under vLLM on the same GPUs in [rtx6kpro#53](https://github.com/local-inference-lab/rtx6kpro/issues/53)). Our root cause is measured on SM120; other archs may differ. Test your own depth before trusting any of us.
 - **The patches** are per-bug, not per-rig. The SM120 dispatch fix, the streaming-detector fixes, and the store guard apply to 2× and 8× configs the same way; ormandj's 2×-card repo already carries overlapping fixes.
 - **The pins** (flashinfer 0.6.15.post1 on this base; the DeepGEMM constraints) hold for Blackwell workstation silicon generally, not just four of them.
-- **What doesn't travel:** every tuned number. TP4/DP4/EP4, mem-fraction, chunk size, γ=4, and all benchmarks are 4×-specific measurements. On different hardware, re-measure; the repro protocol above is the part you can reuse.
+- **What doesn't travel:** every tuned number. TP4/DP4/EP4, mem-fraction, chunk size, the γ=7 choice and its SPS table, and all benchmarks are 4×-specific measurements. On different hardware, re-measure; the repro protocol above is the part you can reuse.
 
 ## Related work
 
