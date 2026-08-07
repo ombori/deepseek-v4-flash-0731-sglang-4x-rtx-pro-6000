@@ -145,7 +145,7 @@ On this topology TP=4 wins aggregate throughput and TP=2 wins bs=1 latency (fewe
 
 ## Building the image yourself
 
-Equivalent to pulling the prebuilt one; the build is deterministic given the pinned base image and patch set. `.github/workflows/build-image.yml` automates build+push but needs a self-hosted runner with ~100 GB free disk. The ~46 GB image does not fit GitHub-hosted runners.
+Equivalent to pulling the prebuilt one; the build is deterministic given the pinned base image and patch set. `.github/workflows/build-image.yml` automates build+push on a GitHub-hosted larger runner (`ubuntu-8core-300gb`, 300 GB disk) — no self-hosted infrastructure needed.
 
 ```sh
 git clone https://github.com/ombori/deepseek-v4-flash-0731-sglang-4x-rtx-pro-6000
@@ -158,7 +158,9 @@ docker compose -f docker-compose.example.yml up -d
 
 ## Measured performance
 
-`sglang.bench_serving`, random 1024-in / 512-out, measured 2026-08-05 at the γ=4 static-verify shape this repo shipped then (only the `--speculative-*` flags removed for the no-spec column); the [2026-08-07 update](#2026-08-07-update-depth-5-root-cause-fixed-gamma-7-structured-outputs) has the current γ=7 numbers. Numbers are output tok/s. The [concurrency sweep](#concurrency-and-operating-points) below is a later run of the same config, so its absolute figures differ by a few percent (run-to-run variance on a thermally soaked box); use the sweep for scaling shape and this table for spec-vs-no-spec.
+**A fresh concurrency sweep at the current γ=7/compact/SPS config is running now (2026-08-07 night); this section and the one below it are being replaced with current numbers shortly.** The tables directly below are from 2026-08-05 at the old γ=4 static-verify shape this repo shipped then — kept temporarily for scaling shape only, not as current numbers. If you're reading this and the tables still say γ=4, check back or open an issue.
+
+`sglang.bench_serving`, random 1024-in / 512-out, measured 2026-08-05 at the γ=4 static-verify shape this repo shipped then (only the `--speculative-*` flags removed for the no-spec column). Numbers are output tok/s.
 
 | workload | no spec | DSPARK γ=4 | Δ |
 |---|---|---|---|
