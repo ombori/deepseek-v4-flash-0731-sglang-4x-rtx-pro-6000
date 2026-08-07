@@ -8,6 +8,12 @@ Everything was measured on exactly this rig, but parts of it travel further than
 
 The existing public recipes for this model target 2× GPU / TP=2 (see [Related work](#related-work)). This one is the 4× / TP=4 / DP-attention shape.
 
+## What this recipe optimizes for
+
+High-concurrency agentic serving: many parallel sessions, tool calling, long contexts. That objective drove the biggest layout choice here — DP attention gives ~4x the KV capacity (MLA's KV cannot be sharded under plain TP, so every added replica of it multiplies concurrent context) and the aggregate numbers below, at a deliberate cost to single-stream latency. On this config we measure ~2,300-2,400 out tok/s at 64 concurrent and 78-98 tok/s at batch size 1.
+
+If your workload is a single interactive stream, there is real headroom on this hardware that this recipe leaves on the table. Our own non-DP TP4 runs measured ~90-98 tok/s at bs=1, TP=2 does better still per stream (fewer PCIe hops; bs=1 decode on these boxes is interconnect-latency bound, not bandwidth bound), and layer-split runtimes avoid the per-layer TP synchronization entirely — llama.cpp with the official GGUF and an MTP draft reaches 100-130 tok/s on two of these cards at 512K context. Each of those trades away something this recipe keeps: concurrency, the full 1M context, or the native-precision checkpoint. Pick the shape that matches your traffic; the numbers in this README only claim to be optimal for ours.
+
 ## 2026-08-06 update: faster prefill
 
 The patch set now carries two additions past the published image: a backport of open PR [#29927](https://github.com/sgl-project/sglang/pull/29927) (the SM120 prefill stack) and a completion patch that puts the #32183 backport on the code path v0.5.16 actually executes. Together with an sgl-deep-gemm bump in the Dockerfile (0.1.4.post1 → 0.1.5.post1, the version #29927 was developed against) and three env vars in the compose file, single-request prefill improves 19–25% at 256–512K contexts and TTFT drops 16–20%. Decode is unchanged (bs=1 within 4%, conc64 +2%).
