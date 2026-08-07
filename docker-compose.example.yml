@@ -1,6 +1,7 @@
 # DeepSeek-V4-Flash-0731 on 4x RTX PRO 6000 Blackwell (SM120), TP4/DP4/EP4,
-# DSPARK speculative decoding at draft depth 4. This is the exact serving
-# shape the README benchmarks were measured on.
+# DSPARK speculative decoding at draft depth 7 with the shipped SPS cost
+# table (compact ragged verify). This is the exact serving shape the README
+# benchmarks were measured on.
 #
 # Prerequisites:
 #   - image built from this repo's Dockerfile (see README quickstart)
@@ -25,6 +26,9 @@ services:
       # Persistent JIT/HF artifact cache — without it /root/.cache is
       # rebuilt on every container recreate (slow first boot each time).
       - ./sglang-cache:/root/.cache
+      # DSPARK gamma-7 SPS additive cost table (ships in this repo; see
+      # README "Regenerating the SPS table" to profile your own).
+      - ./sps:/sps:ro
     environment:
       NVIDIA_VISIBLE_DEVICES: "0,1,2,3"
       HF_HOME: /root/.cache/huggingface
@@ -50,6 +54,13 @@ services:
       SGLANG_FP8_PAGED_MQA_LOGITS_TORCH: "0"
       SGLANG_OPT_USE_TILELANG_INDEXER: "0"
       SGLANG_OPT_DEEPGEMM_HC_PRENORM: "1"
+      # Compact ragged verify: DSpark's confidence-scheduled verify path,
+      # which is what consumes the SPS cost table below. Needs pr32467
+      # (capture race) and dsv4-compact-gamma-runtime (confidence path
+      # viewed by checkpoint-native gamma instead of the runtime window) —
+      # both in this repo's Dockerfile. Without this env the scheduler
+      # degenerates to verify-all and the SPS table is ignored.
+      SGLANG_RAGGED_VERIFY_MODE: "compact"
     deploy:
       resources:
         reservations:
@@ -123,13 +134,20 @@ services:
       - DSPARK
       - --speculative-attention-mode
       - decode
-      # DRAFT DEPTH 4 — set EXPLICITLY, and never omit this flag. Omitting
-      # it infers the checkpoint's native block size (5), which is the one
-      # value that corrupts output on SM120 (v0.5.16 AND upstream main as
-      # of 2026-08-05). Depths 3, 4, 6 and 7 are all clean; only 5 is
-      # broken. See README "Known issues" #1 before changing this.
+      # Draft depth 7, DeepSeek's recipe value. The depth-5 corruption
+      # that used to force an explicit 4 here is root-caused and fixed by
+      # the hc_combine kernel this image carries (README "Known issues"
+      # #1); depth is now a throughput choice. Composed with the SPS
+      # table + compact verify, 7 buys ~+25% bs=1 decode over 4 at a ~7%
+      # conc64 cost — pick 4 if aggregate is all you care about.
       - --speculative-dspark-block-size
-      - "4"
+      - "7"
+      # Gamma-7 SPS additive cost table (profiled at this TP4/DP4 shape;
+      # mounted from ./sps above). Only read under compact verify. If you
+      # change the draft depth or the serving topology, regenerate it —
+      # README "Regenerating the SPS table".
+      - --speculative-dspark-sps-table-path
+      - /sps/dspark_sps_g7.json
       # sgl_kernel custom allreduce fails CUDA-graph capture on PCIe GPU
       # pairs (sglang#11957 class).
       - --disable-custom-all-reduce
@@ -144,3 +162,29 @@ services:
       - deepseekv4
       # Returns cached_tokens in usage.prompt_tokens_details (free).
       - --enable-cache-report
+      # This checkpoint reasons by default; make the template's thinking
+      # switch explicit so clients that don't send chat_template_kwargs
+      # get the calibrated behavior.
+      - --default-chat-template-kwargs
+      - '{"thinking": true}'
+      # DP dispatch with routing-key affinity (pr31170): requests carrying
+      # an x-smg-routing-key header pin to the rendezvous-hashed DP rank,
+      # so multi-turn conversations land on the rank that holds their
+      # radix-cache prefix (measured: turn-2 prefix hits went from ~25%
+      # under round_robin to 8/8). Unkeyed traffic falls back to plain
+      # round_robin — with no keys these flags behave like stock.
+      - --load-balance-method
+      - prefix_affinity
+      - --prefix-affinity-disable-token-fallback
+      - --prefix-affinity-fallback
+      - round_robin
+      # Prefill delayer (pr31835 + pr32880 backports make it safe on
+      # v0.5.16): hold large prefills up to 8 scheduler passes while token
+      # usage is below 0.5 so queued small requests aren't starved during
+      # resume storms. Measured: small-request TTFT p50 130.6 s -> 3-5 s
+      # during an 8x300K-prompt storm, drain within budget.
+      - --enable-prefill-delayer
+      - --prefill-delayer-max-delay-passes
+      - "8"
+      - --prefill-delayer-token-usage-low-watermark
+      - "0.5"
