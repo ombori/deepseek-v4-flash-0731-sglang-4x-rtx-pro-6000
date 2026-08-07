@@ -1,0 +1,783 @@
+diff -ruN a/python/sglang/srt/constrained/base_grammar_backend.py b/python/sglang/srt/constrained/base_grammar_backend.py
+--- a/python/sglang/srt/constrained/base_grammar_backend.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/constrained/base_grammar_backend.py	2026-08-07 17:10:23
+@@ -17,7 +17,7 @@
+ import time
+ from concurrent.futures import Future, ThreadPoolExecutor
+ from dataclasses import dataclass, field
+-from typing import Dict, List, Optional, Tuple
++from typing import Dict, List, NamedTuple, Optional, Tuple
+ 
+ import torch
+ 
+@@ -115,6 +115,19 @@
+         Jump forward occurs, and update the grammar state if needed.
+         """
+         raise NotImplementedError()
++
++
++class GrammarMask(NamedTuple):
++    """A filled vocab_mask plus the backend that applies it.
++
++    The grammar is any one of the batch's -- a handle, not per-request state.
++    """
++
++    grammar: BaseGrammarObject
++    vocab_mask: torch.Tensor
++
++    def apply(self, logits: torch.Tensor) -> None:
++        self.grammar.apply_vocab_mask(logits=logits, vocab_mask=self.vocab_mask)
+ 
+ 
+ class InvalidGrammarObject(BaseGrammarObject):
+diff -ruN a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/managers/scheduler.py	2026-08-07 17:11:06
+@@ -2201,7 +2201,9 @@
+         self._maybe_namespace_elastic_radix_cache(req)
+ 
+         if self.spec_algorithm.is_dflash_family():
+-            error_msg = validate_dflash_request(req, self.enable_overlap)
++            error_msg = validate_dflash_request(
++                req, self.enable_overlap, self.spec_algorithm
++            )
+             if error_msg is not None:
+                 req.set_finish_with_abort(error_msg)
+                 self.init_req_max_new_tokens(req)
+diff -ruN a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+--- a/python/sglang/srt/model_executor/model_runner.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/model_executor/model_runner.py	2026-08-07 17:11:06
+@@ -1484,10 +1484,10 @@
+ 
+         # Release the vocab_mask GPU tensor immediately after it has been applied
+         # to the logits. In overlap scheduling, the sampling_info (and its
+-        # vocab_mask) can be kept alive by the delay_sample_func closure and
++        # grammar_mask) can be kept alive by the delay_sample_func closure and
+         # batch_record_buf until the next iteration, causing a steady VRAM leak
+         # when structured output (grammar) is used.
+-        sampling_info.vocab_mask = None
++        sampling_info.grammar_mask = None
+ 
+     def sample(
+         self,
+diff -ruN a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+--- a/python/sglang/srt/sampling/sampling_batch_info.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/sampling/sampling_batch_info.py	2026-08-07 17:10:49
+@@ -2,11 +2,15 @@
+ 
+ import dataclasses
+ import logging
+-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
++from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+ 
+ import torch
+ 
+ import sglang.srt.sampling.penaltylib as penaltylib
++from sglang.srt.constrained.base_grammar_backend import (
++    BaseGrammarObject,
++    GrammarMask,
++)
+ from sglang.srt.runtime_context import get_server_args
+ from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+ from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+@@ -44,11 +48,10 @@
+ 
+     # Masking tensors for grammar-guided structured outputs
+     vocab_size: int
+-    grammars: Optional[List] = None
++    grammars: Optional[List[Optional[BaseGrammarObject]]] = None
+     rids_int: Optional[torch.Tensor] = None
+     bootstrap_room_ids_int: Optional[torch.Tensor] = None
+-    vocab_mask: Optional[torch.Tensor] = None
+-    apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
++    grammar_mask: Optional[GrammarMask] = None
+ 
+     # Penalizer
+     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
+@@ -235,30 +238,27 @@
+ 
+     def update_regex_vocab_mask(self):
+         if not self.grammars:
+-            self.vocab_mask = None
+-            self.apply_mask_func = None
++            self.grammar_mask = None
+             return
+ 
+         # Find a grammar from the list
+         first_grammar = next(grammar for grammar in self.grammars if grammar)
+ 
+         # TODO(lianmin): Maybe we can reuse the existing mask?
+-        self.vocab_mask = first_grammar.allocate_vocab_mask(
++        vocab_mask = first_grammar.allocate_vocab_mask(
+             vocab_size=self.vocab_size,
+             batch_size=len(self.temperatures),
+             device=self.device,
+         )
+-        self.apply_mask_func = (
+-            first_grammar.apply_vocab_mask
+-        )  # force to use static method
+ 
+         # Apply the mask
+         for i, grammar in enumerate(self.grammars):
+             if grammar and not grammar.finished and not grammar.is_terminated():
+-                grammar.fill_vocab_mask(self.vocab_mask, i)
++                grammar.fill_vocab_mask(vocab_mask, i)
+ 
+         # Move the mask to the device if needed
+-        self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
++        vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
++        self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
+ 
+     def update_penalties(self):
+         if self.penalizer_orchestrator.is_required:
+@@ -290,8 +290,8 @@
+             # Used in the non-overlap mode
+             self.penalizer_orchestrator.apply(logits)
+ 
+-        if self.vocab_mask is not None:
+-            self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
++        if self.grammar_mask is not None:
++            self.grammar_mask.apply(logits)
+ 
+         if self.logit_bias is not None:
+             logits.add_(self.logit_bias)
+diff -ruN a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+--- a/python/sglang/srt/speculative/dflash_utils.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/dflash_utils.py	2026-08-07 17:12:21
+@@ -12,6 +12,7 @@
+ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+ from sglang.srt.layers.sampler import apply_custom_logit_processor
+ from sglang.srt.managers.schedule_batch import Req
++from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+ from sglang.srt.utils import is_cuda, is_musa
+ 
+ DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+@@ -145,7 +146,7 @@
+ 
+     acc_additive_penalties = getattr(sampling_info, "acc_additive_penalties", None)
+     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+-    vocab_mask = getattr(sampling_info, "vocab_mask", None)
++    grammar_mask = getattr(sampling_info, "grammar_mask", None)
+     logit_bias = getattr(sampling_info, "logit_bias", None)
+ 
+     logits_3d: Optional[torch.Tensor] = None
+@@ -161,7 +162,7 @@
+     # broadcast over the verify block without materializing a repeated buffer.
+     if (
+         penalizer is not None and penalizer.is_required and acc_additive_penalties is None
+-    ) or vocab_mask is not None:
++    ) or grammar_mask is not None:
+         linear_penalty = torch.zeros(
+             (bs, next_token_logits.shape[1]),
+             dtype=torch.float32,
+@@ -793,21 +794,25 @@
+     return target_probs.view(bs, draft_token_num, -1).contiguous()
+ 
+ 
+-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
++def validate_dflash_request(
++    req: Req, enable_overlap: bool, spec_algorithm: SpeculativeAlgorithm
++) -> Optional[str]:
+     if req.return_logprob:
+         return "DFLASH speculative decoding does not support return_logprob yet."
+ 
+     if enable_overlap and req.return_hidden_states:
+         return "DFLASH speculative decoding does not support return_hidden_states yet."
+ 
+-    if (
++    # Grammar support in this family is the verify-time bitmask over the draft
++    # chain, so the capability that gates the verify mask also gates admission.
++    if not spec_algorithm.supports_grammar_overlap() and (
+         req.sampling_params.json_schema is not None
+         or req.sampling_params.regex is not None
+         or req.sampling_params.ebnf is not None
+         or req.sampling_params.structural_tag is not None
+     ):
+         return (
+-            "DFLASH speculative decoding does not support "
++            f"{spec_algorithm.name} speculative decoding does not support "
+             "grammar-constrained decoding yet."
+         )
+ 
+diff -ruN a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py	2026-08-07 17:12:55
+@@ -47,7 +47,11 @@
+     make_draft_sampler_capture_hook,
+ )
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
++from sglang.srt.speculative.spec_utils import (
++    GrammarTree,
++    assign_req_to_token_pool_func,
++    build_grammar_vocab_mask,
++)
+ from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
+ 
+ _is_npu = is_npu()
+@@ -1367,6 +1371,7 @@
+         self,
+         batch: ScheduleBatch,
+         on_publish=None,
++        grammar_barrier=None,
+     ) -> GenerationBatchResult:
+         if getattr(batch, "return_logprob", False):
+             raise ValueError(
+@@ -1633,6 +1638,11 @@
+         draft_tokens[:, 0].copy_(block_ids[:, 0])
+         draft_tokens[:, 1:].copy_(draft_next)
+ 
++        # Must stay ahead of the target verify launch below.
++        grammar_tree = (
++            GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
++        )
++
+         # --- 2) Target verify.
+         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
+         custom_mask = None
+@@ -1678,12 +1688,26 @@
+         logits_output = target_out.logits_output
+         can_run_cuda_graph = target_out.can_run_cuda_graph
+ 
++        grammar_mask = None
++        if batch.has_grammar:
++            grammar_mask = build_grammar_vocab_mask(
++                reqs=batch.reqs,
++                tree=grammar_tree,
++                sampling_info=batch.sampling_info,
++                device=logits_output.next_token_logits.device,
++                barrier=grammar_barrier,
++            )
++
+         if sampling_info is not None:
+             apply_dflash_verify_logits_adjustments(
+                 next_token_logits=logits_output.next_token_logits,
+                 sampling_info=sampling_info,
+                 draft_token_num=int(self.block_size),
+             )
++
++        # Constrain every chain position before accept picks from it.
++        if grammar_mask is not None:
++            grammar_mask.apply(logits_output.next_token_logits)
+ 
+         candidates = draft_tokens
+         new_seq_lens = None
+diff -ruN a/python/sglang/srt/speculative/dspark_components/dspark_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_verify.py
+--- a/python/sglang/srt/speculative/dspark_components/dspark_verify.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/dspark_components/dspark_verify.py	2026-08-07 17:14:38
+@@ -50,7 +50,7 @@
+     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+     if penalizer is not None and penalizer.is_required:
+         return False
+-    if getattr(sampling_info, "vocab_mask", None) is not None:
++    if getattr(sampling_info, "grammar_mask", None) is not None:
+         return False
+     if getattr(sampling_info, "logit_bias", None) is not None:
+         return False
+diff -ruN a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py	2026-08-07 17:13:23
+@@ -53,7 +53,11 @@
+     TargetVerifyExecutor,
+     verify_logits_adjustments_are_noop,
+ )
+-from sglang.srt.speculative.spec_utils import draft_tp_context
++from sglang.srt.speculative.spec_utils import (
++    GrammarTree,
++    build_grammar_vocab_mask,
++    draft_tp_context,
++)
+ from sglang.srt.utils import get_available_gpu_memory, is_cuda
+ 
+ logger = logging.getLogger(__name__)
+@@ -358,6 +362,7 @@
+         self,
+         batch: ScheduleBatch,
+         on_publish=None,
++        grammar_barrier=None,
+     ) -> GenerationBatchResult:
+         if getattr(batch, "return_logprob", False):
+             raise ValueError(
+@@ -369,7 +374,7 @@
+             self._observers.note_prefill_step()
+             return self._forward_prefill(batch, on_publish)
+ 
+-        return self._forward_decode(batch, on_publish)
++        return self._forward_decode(batch, on_publish, grammar_barrier)
+ 
+     def _forward_prefill(
+         self, batch: ScheduleBatch, on_publish
+@@ -475,7 +480,7 @@
+         )
+ 
+     def _forward_decode(
+-        self, batch: ScheduleBatch, on_publish
++        self, batch: ScheduleBatch, on_publish, grammar_barrier=None
+     ) -> GenerationBatchResult:
+         if batch.spec_info is None:
+             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
+@@ -568,11 +573,19 @@
+             [draft_block_ids[:, :1], draft_tokens], dim=1
+         ).contiguous()
+ 
++        # Must stay ahead of the target verify launch below.
++        grammar_tree = (
++            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
++        )
++
++        # A live grammar forces the eager path: the folded epilogue accepts inside
++        # the cuda graph off its own buffers, where the mask below never lands.
+         fold_eligible = (
+             self._verify_executor.verify_epilogue is not None
+             and proposal.folded
+             and verify_logits_adjustments_are_noop(sampling_info)
+             and self._simulate_acc_len <= 0
++            and not batch.has_grammar
+         )
+         with self._observers.segment(InfoSegment.TARGET_VERIFY):
+             if run_compact:
+@@ -597,6 +610,19 @@
+                 hidden_strided = None
+         logits_output = target_verify.logits_output
+         can_run_cuda_graph = target_verify.can_run_cuda_graph
++
++        if batch.has_grammar:
++            # run_compact scatters its rows back to (bs * chain_len), so the mask
++            # lines up with the logits on both verify paths.
++            grammar_mask = build_grammar_vocab_mask(
++                reqs=batch.reqs,
++                tree=grammar_tree,
++                sampling_info=sampling_info,
++                device=logits_output.next_token_logits.device,
++                barrier=grammar_barrier,
++            )
++            if grammar_mask is not None:
++                grammar_mask.apply(logits_output.next_token_logits)
+ 
+         epilogue = self._verify_executor.verify_epilogue
+         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
+diff -ruN a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
+--- a/python/sglang/srt/speculative/eagle_info.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/eagle_info.py	2026-08-07 17:14:38
+@@ -5,7 +5,6 @@
+ import torch
+ 
+ from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+ from sglang.srt.environ import envs
+ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+ from sglang.srt.runtime_context import get_server_args
+@@ -29,7 +28,6 @@
+     capture_hidden_mode: CaptureHiddenMode
+     seq_lens_sum: int
+     seq_lens_cpu: torch.Tensor
+-    grammar: BaseGrammarObject = None
+     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
+     # vocab); only set under rejection sampling. Consumed by the verify kernel.
+     draft_probs: torch.Tensor = None
+diff -ruN a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
+--- a/python/sglang/srt/speculative/eagle_utils.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/eagle_utils.py	2026-08-07 17:14:38
+@@ -28,6 +28,7 @@
+ from sglang.srt.utils.async_probe import maybe_detect_oob
+ 
+ if TYPE_CHECKING:
++    from sglang.srt.constrained.base_grammar_backend import GrammarMask
+     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+     from sglang.srt.managers.schedule_batch import ScheduleBatch
+     from sglang.srt.managers.tp_worker import TpModelWorker
+@@ -570,7 +571,7 @@
+     verify_input: EagleVerifyInput,
+     batch: ScheduleBatch,
+     logits_output: LogitsProcessorOutput,
+-    vocab_mask: torch.Tensor = None,
++    grammar_mask: Optional[GrammarMask] = None,
+ ):
+     """
+     Verify and find accepted tokens based on logits output and batch
+@@ -631,11 +632,8 @@
+         )
+ 
+     # Apply grammar mask if provided
+-    if vocab_mask is not None:
+-        assert verify_input.grammar is not None
+-        verify_input.grammar.apply_vocab_mask(
+-            logits=next_token_logits, vocab_mask=vocab_mask
+-        )
++    if grammar_mask is not None:
++        grammar_mask.apply(next_token_logits)
+ 
+     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
+     predict_shape = list(next_token_logits.shape)[:-1]
+diff -ruN a/python/sglang/srt/speculative/eagle_worker_common.py b/python/sglang/srt/speculative/eagle_worker_common.py
+--- a/python/sglang/srt/speculative/eagle_worker_common.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/eagle_worker_common.py	2026-08-07 17:14:38
+@@ -23,8 +23,9 @@
+     eagle_sample,
+ )
+ from sglang.srt.speculative.spec_utils import (
++    GrammarTree,
++    build_grammar_vocab_mask,
+     commit_mamba_states_after_verify,
+-    generate_token_bitmask,
+     move_accept_tokens_to_target_kvcache,
+     record_stream_each,
+     record_stream_for_v2_verify,
+@@ -467,6 +468,7 @@
+     device: str,
+     metadata_ready_pre_pad: bool,
+     finalize_tree_path: bool,
++    grammar_barrier=None,
+ ) -> GenerationBatchResult:
+     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
+ 
+@@ -527,13 +529,16 @@
+             ),
+         )
+ 
+-    # Prepare grammar data on CPU if needed
+-    if batch.has_grammar:
+-        retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+-        retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
+-        draft_tokens_cpu = verify_input.draft_token.view(
+-            verify_input.retrieve_next_token.shape
+-        ).cpu()
++    # Must stay ahead of the target verify launch below.
++    grammar_tree = (
++        GrammarTree.from_device(
++            verify_input.retrieve_next_token,
++            verify_input.retrieve_next_sibling,
++            verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
++        )
++        if batch.has_grammar
++        else None
++    )
+ 
+     if metadata_ready_pre_pad:
+         # Multi-layer eagle preserved-verbatim behavior: metadata init is
+@@ -559,25 +564,16 @@
+     logits_output = forward_batch_output.logits_output
+ 
+     # Generate vocab mask for constrained decoding
+-    vocab_mask = None
++    grammar_mask = None
+     if batch.has_grammar:
+-        # Generate the logit mask for structured output.
+-        vocab_mask = generate_token_bitmask(
+-            batch.reqs,
+-            verify_input,
+-            retrieve_next_token_cpu,
+-            retrieve_next_sibling_cpu,
+-            draft_tokens_cpu,
+-            batch.sampling_info.vocab_size,
++        grammar_mask = build_grammar_vocab_mask(
++            reqs=batch.reqs,
++            tree=grammar_tree,
++            sampling_info=batch.sampling_info,
++            device=verify_input.retrieve_next_token.device,
++            barrier=grammar_barrier,
+         )
+ 
+-        if vocab_mask is not None:
+-            assert verify_input.grammar is not None
+-            vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+-            # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
+-            # and will be applied to produce wrong results
+-            batch.sampling_info.vocab_mask = None
+-
+     # Sample
+     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+@@ -585,7 +581,7 @@
+         predict,
+         accept_lens,
+         accept_index,
+-    ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
++    ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+     new_seq_lens = batch.seq_lens + accept_lens
+     clear_unaccepted_c128 = getattr(
+         token_to_kv_pool_allocator.get_kvcache(),
+diff -ruN a/python/sglang/srt/speculative/ngram_info.py b/python/sglang/srt/speculative/ngram_info.py
+--- a/python/sglang/srt/speculative/ngram_info.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/ngram_info.py	2026-08-07 17:14:38
+@@ -5,7 +5,6 @@
+ import torch
+ 
+ from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+ 
+ 
+@@ -19,7 +18,6 @@
+         retrieve_next_token: torch.Tensor = None,
+         retrieve_next_sibling: torch.Tensor = None,
+         draft_token_num: int = None,
+-        grammar: BaseGrammarObject = None,
+         future_indices: Optional[torch.Tensor] = None,
+         new_seq_lens: Optional[torch.Tensor] = None,
+         accept_tokens: Optional[torch.Tensor] = None,
+@@ -35,7 +33,6 @@
+         self.draft_token_num = draft_token_num
+         self.num_tokens_per_req = draft_token_num
+         self.num_tokens_for_logprob_per_req = draft_token_num
+-        self.grammar = grammar
+ 
+         # Inputs for V2 overlap worker
+         self.future_indices = future_indices
+diff -ruN a/python/sglang/srt/speculative/ngram_worker.py b/python/sglang/srt/speculative/ngram_worker.py
+--- a/python/sglang/srt/speculative/ngram_worker.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/ngram_worker.py	2026-08-07 17:14:38
+@@ -21,8 +21,9 @@
+ from sglang.srt.speculative.eagle_utils import eagle_sample
+ from sglang.srt.speculative.ngram_info import NgramVerifyInput
+ from sglang.srt.speculative.spec_utils import (
++    GrammarTree,
++    build_grammar_vocab_mask,
+     commit_mamba_states_after_verify,
+-    generate_token_bitmask,
+     move_accept_tokens_to_target_kvcache,
+     prepare_mamba_track_for_verify,
+     record_stream_for_v2_verify,
+@@ -380,13 +381,18 @@
+         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
+ 
+         if batch.forward_mode.is_target_verify():
+-            # Prepare grammar data on CPU if needed
+-            if batch.has_grammar:
+-                retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+-                retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
+-                draft_tokens_cpu = verify_input.draft_token.view(
+-                    verify_input.retrieve_next_token.shape
+-                ).cpu()
++            # Must stay ahead of the target verify launch below.
++            grammar_tree = (
++                GrammarTree.from_device(
++                    verify_input.retrieve_next_token,
++                    verify_input.retrieve_next_sibling,
++                    verify_input.draft_token.view(
++                        verify_input.retrieve_next_token.shape
++                    ),
++                )
++                if batch.has_grammar
++                else None
++            )
+ 
+             batch_result = self.target_worker.forward_batch_generation(
+                 batch, is_verify=True
+@@ -398,26 +404,17 @@
+             )
+ 
+             verify_input: NgramVerifyInput = batch.spec_info
+-            vocab_mask = None
++            grammar_mask = None
+             if batch.has_grammar:
+-                # Generate the logit mask for structured output.
+-                # Overlap the CPU operations for bitmask generation with the forward pass.
+-                vocab_mask = generate_token_bitmask(
+-                    batch.reqs,
+-                    verify_input,
+-                    retrieve_next_token_cpu,
+-                    retrieve_next_sibling_cpu,
+-                    draft_tokens_cpu,
+-                    batch.sampling_info.vocab_size,
++                grammar_mask = build_grammar_vocab_mask(
++                    reqs=batch.reqs,
++                    tree=grammar_tree,
++                    sampling_info=batch.sampling_info,
++                    device=verify_input.retrieve_next_token.device,
++                    # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
++                    barrier=None,
+                 )
+ 
+-                if vocab_mask is not None:
+-                    assert verify_input.grammar is not None
+-                    vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
+-                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
+-                    # and will be applied to produce wrong results
+-                    batch.sampling_info.vocab_mask = None
+-
+             # Sample
+             maybe_detect_nan(
+                 logits_output.next_token_logits, "verify: target model logits"
+@@ -429,7 +426,7 @@
+                 predict,
+                 accept_lens,
+                 accept_index,
+-            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
++            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+             new_seq_lens = batch.seq_lens + accept_lens
+             commit_mamba_states_after_verify(
+                 self.target_worker,
+diff -ruN a/python/sglang/srt/speculative/spec_info.py b/python/sglang/srt/speculative/spec_info.py
+--- a/python/sglang/srt/speculative/spec_info.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/spec_info.py	2026-08-07 17:11:41
+@@ -133,6 +133,18 @@
+         graphs in the decode cuda graph runner."""
+         return self.is_dspark()
+ 
++    def supports_grammar_overlap(self) -> bool:
++        # Whether the worker's verify step builds the grammar bitmask over the
++        # verify tree/chain and applies it to the target logits before
++        # acceptance, so grammar-constrained requests can be admitted under
++        # speculative decoding. On this branch the scheduler serializes
++        # grammar spec batches (need_grammar_sync) instead of handing the
++        # worker a grammar barrier, so the FSM advance always precedes the
++        # bitmask build. NGRAM drafts from a host corpus lookup, so it stays
++        # synchronous by design. STANDALONE inherits the EAGLE V2 worker's
++        # verify path.
++        return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
++
+     def has_draft_kv(self) -> bool:
+         """Whether the draft phase writes KV chains. NGRAM does not (its tree
+         lives only in the verify mask), so per-decode KV sizing needs no
+diff -ruN a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
+--- a/python/sglang/srt/speculative/spec_utils.py	2026-08-07 17:09:57
++++ b/python/sglang/srt/speculative/spec_utils.py	2026-08-07 17:11:41
+@@ -5,7 +5,7 @@
+ import os
+ import time
+ from contextlib import contextmanager
+-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
++from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
+ 
+ import torch
+ from huggingface_hub import snapshot_download
+@@ -32,12 +32,14 @@
+     fill_accept_out_cache_loc_func as fill_accept_out_cache_loc_func,
+ )
+ from sglang.srt.configs.hybrid_arch import mambaish_config
++from sglang.srt.constrained.base_grammar_backend import GrammarMask
+ from sglang.srt.distributed.parallel_state import (
+     GroupCoordinator,
+     patch_tensor_parallel_group,
+ )
+ from sglang.srt.environ import envs
+ from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
++from sglang.srt.managers.utils import _async_d2h
+ from sglang.srt.mem_cache.allocation import (
+     assign_req_to_token_pool as assign_req_to_token_pool,
+ )
+@@ -69,8 +71,8 @@
+     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+     from sglang.srt.managers.tp_worker import TpModelWorker
+     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
++    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+     from sglang.srt.server_args import ServerArgs
+-    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+ 
+ 
+ if _is_cuda:
+@@ -499,12 +501,11 @@
+ 
+ def generate_token_bitmask(
+     reqs: List[Req],
+-    verify_input: EagleVerifyInput,
+     retrieve_next_token_cpu: torch.Tensor,
+     retrieve_next_sibling_cpu: torch.Tensor,
+     draft_tokens_cpu: torch.Tensor,
+     vocab_size: int,
+-):
++) -> Tuple[Optional[torch.Tensor], Optional[BaseGrammarObject]]:
+     """
+     Generate the logit mask for structured output.
+     Draft model's token can be either valid or invalid with respect to the grammar.
+@@ -545,8 +546,97 @@
+                     f"grammar: {req.grammar}"
+                 )
+ 
+-    verify_input.grammar = grammar
+-    return allocate_token_bitmask
++    return allocate_token_bitmask, grammar
++
++
++class GrammarTree:
++    """The verify tree the grammar bitmask is built over, on the host.
++
++    ``from_device`` starts an async copy, so build it before the target verify
++    launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
++    """
++
++    def __init__(self, host: Tuple[torch.Tensor, ...], done_event):
++        self._host = host
++        self._done = done_event
++
++    @classmethod
++    def from_device(
++        cls,
++        retrieve_next_token: torch.Tensor,
++        retrieve_next_sibling: torch.Tensor,
++        draft_token: torch.Tensor,
++    ) -> GrammarTree:
++        tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
++        host = tuple(_async_d2h(t) for t in tensors)
++        # Sources may be mixed -- an algorithm can synthesize part of the tree on
++        # the host -- so the event has to key off whichever one is on device.
++        device = next((t.device for t in tensors if t.device.type != "cpu"), None)
++        if device is None:
++            return cls(host, None)
++        done = torch.get_device_module(device).Event()
++        done.record()
++        return cls(host, done)
++
++    @classmethod
++    def from_host(
++        cls,
++        retrieve_next_token: torch.Tensor,
++        retrieve_next_sibling: torch.Tensor,
++        draft_token: torch.Tensor,
++    ) -> GrammarTree:
++        return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
++
++    @classmethod
++    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> GrammarTree:
++        """Degenerate tree for chain-verify algorithms: node i's only child is i + 1.
++
++        ``verify_ids_2d`` is (bs, chain_len) with column 0 the already-committed
++        token, so mask rows line up with the target's logits rows one-for-one.
++        Only the ids need a copy; the links are fixed by the shape.
++        """
++        bs, chain_len = verify_ids_2d.shape
++        next_token = torch.full((bs, chain_len), -1, dtype=torch.int64)
++        next_token[:, :-1] = torch.arange(1, chain_len, dtype=torch.int64)
++        next_sibling = torch.full((bs, chain_len), -1, dtype=torch.int64)
++        return cls.from_device(next_token, next_sibling, verify_ids_2d)
++
++    def resolve(self) -> Tuple[torch.Tensor, ...]:
++        if self._done is not None:
++            self._done.synchronize()
++        return self._host
++
++
++def build_grammar_vocab_mask(
++    *,
++    reqs: List[Req],
++    tree: GrammarTree,
++    sampling_info: SamplingBatchInfo,
++    device,
++    barrier: Optional[Callable[[], None]],
++) -> Optional[GrammarMask]:
++    """Build the constrained-decoding bitmask over a verify tree and stage it on device.
++
++    Call it after the target verify launch -- every step here is host work, so it all
++    overlaps that forward. ``barrier`` advances the previous batch's FSM over its
++    committed tokens, which the traversal then reads, so it has to run first.
++    """
++    if barrier is not None:
++        barrier()
++    vocab_mask, grammar = generate_token_bitmask(
++        reqs,
++        *tree.resolve(),
++        sampling_info.vocab_size,
++    )
++    if vocab_mask is None:
++        return None
++
++    # non_blocking is safe: the bitmask is pinned (see xgrammar_backend), and stream
++    # order keeps the copy ahead of the sampler's apply_vocab_mask.
++    vocab_mask = vocab_mask.to(device, non_blocking=True)
++    # Otherwise the extend stage's leftover mask is applied instead.
++    sampling_info.grammar_mask = None
++    return GrammarMask(grammar, vocab_mask)
+ 
+ 
+ def load_token_map(token_map_path: str) -> List[int]:

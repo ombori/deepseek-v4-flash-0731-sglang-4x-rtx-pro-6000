@@ -7,9 +7,14 @@
 #     and must apply AFTER it (hunks verified non-overlapping in that order).
 #   - pr33531 and later diffs touch dspark_verify.py; order verified on a
 #     clean v0.5.16 worktree.
-#   - pr29927 was generated against the full preceding stack and applies
-#     LAST (it shares files with flash_mla_sm120 and server_args hunks
-#     earlier in the list).
+#   - pr29927 was generated against the full preceding stack (it shares
+#     files with flash_mla_sm120 and server_args hunks earlier in the
+#     list); the nine diffs after it were generated against the stack up
+#     to and including it.
+#   - pr30096-family (consolidation of merged upstream #30096 + #32393 +
+#     #32409, re-anchored to v0.5.16) touches spec_utils.py,
+#     dspark_verify.py, dflash_utils.py and scheduler.py after pr33531,
+#     pr32880 and pr33805 have already modified them, so it applies LAST.
 # All prNNNNN-notest.diff files are upstream PR diffs pinned at review time
 # with test-file hunks stripped (the runtime image ships no test/ tree);
 # pr31017 retains its test hunk because the path exists in-image.
@@ -35,7 +40,16 @@ RUN cd /sgl-workspace/sglang \
     && git apply --verbose /tmp/patches/dsv4-streaming-preamble-fix.diff \
     && git apply --verbose /tmp/patches/dsv4-c4-ring-depth-scale.diff \
     && git apply --verbose /tmp/patches/pr29927-notest.diff \
-    && python3 -c "import ast; [ast.parse(open(f).read()) for f in ('python/sglang/srt/function_call/deepseekv32_detector.py','python/sglang/srt/function_call/base_format_detector.py','python/sglang/srt/entrypoints/openai/serving_chat.py','python/sglang/srt/parser/reasoning_parser.py','python/sglang/kernels/ops/attention/flash_mla_sm120.py','python/sglang/srt/speculative/dspark_components/dspark_draft.py','python/sglang/jit_kernel/dsv4/compress.py','python/sglang/srt/layers/attention/deepseek_v4_backend.py','python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py','python/sglang/srt/layers/attention/dsv4/compressor_v2.py','python/sglang/srt/layers/attention/dsv4/indexer.py','python/sglang/srt/layers/attention/dsv4/metadata.py','python/sglang/srt/speculative/dflash_utils.py','python/sglang/srt/speculative/dspark_components/dspark_verify.py','python/sglang/srt/speculative/spec_utils.py','python/sglang/srt/layers/moe/topk.py','python/sglang/kernels/ops/layernorm/mhc.py','python/sglang/srt/layers/deep_gemm_wrapper/configurer.py','python/sglang/srt/layers/moe/moe_runner/deep_gemm.py','python/sglang/srt/model_loader/utils.py','python/sglang/srt/models/deepseek_v4.py','python/sglang/srt/server_args.py')]; print('all patched files parse OK')"
+    && git apply --verbose /tmp/patches/pr31170-notest.diff \
+    && git apply --verbose /tmp/patches/pr31835-notest.diff \
+    && git apply --verbose /tmp/patches/pr32880-notest.diff \
+    && git apply --verbose /tmp/patches/pr27199-notest.diff \
+    && git apply --verbose /tmp/patches/dsv4-compact-gamma-runtime.diff \
+    && git apply --verbose /tmp/patches/pr33805-notest.diff \
+    && git apply --verbose /tmp/patches/pr33568-notest.diff \
+    && git apply --verbose /tmp/patches/pr32686-notest.diff \
+    && git apply --verbose /tmp/patches/pr30096-family-notest.diff \
+    && python3 -c "import ast; [ast.parse(open(f).read()) for f in ('python/sglang/srt/function_call/deepseekv32_detector.py','python/sglang/srt/function_call/base_format_detector.py','python/sglang/srt/entrypoints/openai/serving_chat.py','python/sglang/srt/parser/reasoning_parser.py','python/sglang/kernels/ops/attention/flash_mla_sm120.py','python/sglang/srt/speculative/dspark_components/dspark_draft.py','python/sglang/jit_kernel/dsv4/compress.py','python/sglang/srt/layers/attention/deepseek_v4_backend.py','python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py','python/sglang/srt/layers/attention/dsv4/compressor_v2.py','python/sglang/srt/layers/attention/dsv4/indexer.py','python/sglang/srt/layers/attention/dsv4/metadata.py','python/sglang/srt/speculative/dflash_utils.py','python/sglang/srt/speculative/dspark_components/dspark_verify.py','python/sglang/srt/speculative/spec_utils.py','python/sglang/srt/layers/moe/topk.py','python/sglang/kernels/ops/layernorm/mhc.py','python/sglang/srt/layers/deep_gemm_wrapper/configurer.py','python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py','python/sglang/srt/layers/moe/moe_runner/deep_gemm.py','python/sglang/srt/model_loader/utils.py','python/sglang/srt/models/deepseek_v4.py','python/sglang/srt/models/deepseek_v4_dspark.py','python/sglang/srt/server_args.py','python/sglang/srt/managers/data_parallel_controller.py','python/sglang/srt/managers/schedule_policy.py','python/sglang/srt/managers/prefill_delayer.py','python/sglang/srt/managers/scheduler.py','python/sglang/srt/managers/io_struct.py','python/sglang/srt/constrained/base_grammar_backend.py','python/sglang/srt/model_executor/model_runner.py','python/sglang/srt/sampling/sampling_batch_info.py','python/sglang/srt/speculative/dflash_worker_v2.py','python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py','python/sglang/srt/speculative/eagle_info.py','python/sglang/srt/speculative/eagle_utils.py','python/sglang/srt/speculative/eagle_worker_common.py','python/sglang/srt/speculative/ngram_info.py','python/sglang/srt/speculative/ngram_worker.py','python/sglang/srt/speculative/spec_info.py')]; print('all patched files parse OK')"
 
 # flashinfer 0.6.14 (base image) -> 0.6.15.post1 (sglang main's own pin).
 # Do NOT bump to 0.6.16.post1: it segfaults v0.5.16 CUDA-graph capture on
