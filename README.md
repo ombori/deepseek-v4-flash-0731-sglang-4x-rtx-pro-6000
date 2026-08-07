@@ -10,7 +10,7 @@ The existing public recipes for this model target 2× GPU / TP=2 (see [Related w
 
 ## What this recipe optimizes for
 
-High-concurrency agentic serving: many parallel sessions, tool calling, long contexts. That objective drove the biggest layout choice here — DP attention gives ~4x the KV capacity (MLA's KV cannot be sharded under plain TP, so every added replica of it multiplies concurrent context) and the aggregate numbers below, at a deliberate cost to single-stream latency. On this config we measure ~2,200 out tok/s at 64 concurrent and 102-112 tok/s at batch size 1 on real prose (the gamma-7 + SPS-table config in the 2026-08-07 update closed most of the old bs=1 gap).
+High-concurrency agentic serving: many parallel sessions, tool calling, long contexts. That objective drove the biggest layout choice here — DP attention gives ~4x the KV capacity (MLA's KV cannot be sharded under plain TP, so every added replica of it multiplies concurrent context) and the aggregate numbers below, at a deliberate cost to single-stream latency. On this config we measure ~2,460 out tok/s at 64 concurrent (random dataset) and 102-112 tok/s at batch size 1 on real prose (the gamma-7 + SPS-table config in the 2026-08-07 update closed most of the old bs=1 gap).
 
 If your workload is a single interactive stream, other shapes still have something to offer. TP=2 does better per stream (fewer PCIe hops; bs=1 decode on these boxes is interconnect-latency bound, not bandwidth bound), and layer-split runtimes avoid the per-layer TP synchronization entirely — llama.cpp with the official GGUF and an MTP draft reaches 100-130 tok/s on two of these cards at 512K context. Each of those trades away something this recipe keeps: concurrency, the full 1M context, or the native-precision checkpoint. Pick the shape that matches your traffic; the numbers in this README only claim to be optimal for ours.
 
@@ -158,43 +158,33 @@ docker compose -f docker-compose.example.yml up -d
 
 ## Measured performance
 
-**A fresh concurrency sweep at the current γ=7/compact/SPS config is running now (2026-08-07 night); this section and the one below it are being replaced with current numbers shortly.** The tables directly below are from 2026-08-05 at the old γ=4 static-verify shape this repo shipped then — kept temporarily for scaling shape only, not as current numbers. If you're reading this and the tables still say γ=4, check back or open an issue.
+`sglang.bench_serving`, random dataset, measured 2026-08-07 on the current shipped config (γ=7, compact ragged verify, the profiled SPS cost table, prefix-affinity dispatch, prefill delayer — everything in the [2026-08-07 update](#2026-08-07-update-depth-5-root-cause-fixed-gamma-7-structured-outputs)), fresh server boot for a clean cache. Numbers are output tok/s unless noted.
 
-`sglang.bench_serving`, random 1024-in / 512-out, measured 2026-08-05 at the γ=4 static-verify shape this repo shipped then (only the `--speculative-*` flags removed for the no-spec column). Numbers are output tok/s.
+Real-prose bs=1 (not the synthetic random dataset): 102–112 tok/s on prose, 141–184 on content-heavy generations — see the 2026-08-07 update for that measurement and the caveat below on why it differs from the random-dataset number.
 
-| workload | no spec | DSPARK γ=4 | Δ |
-|---|---|---|---|
-| conc 16 | 619 | **1196** | +93% |
-| conc 16 mean TTFT | 955 ms | **408 ms** | −57% |
-| conc 16 mean ITL | — | **11.9 ms** | |
-| conc 64 | 1511 | **2297** (mean ITL 25 ms) | +52% |
-| bs=1 decode | ~62 | **78–90** | |
-
-One caveat you should not skip: synthetic prompts flatter spec decode. Random-token prompts drive the model into highly predictable continuations, which DSPARK predicts almost perfectly. We measured accept length 4.4–4.7 of 5 draft tokens on random prompts versus ~2.1 on real prose, so treat the decode-bound figures above as roughly 2× optimistic for real agentic traffic. The bs=1 essay-prompt measurement (~85 tok/s) is the more honest single-stream number.
-
-Accept length at γ=4 is 2.0–2.2 of 5 verify rows on real text, and it stays ~2.2 at every depth we tested (3, 4, 6, 7). The draft head realises about the same number of tokens regardless of window, so under static verify-all wider windows only dilute the accept rate and cost bs=1 latency — γ=4 measured best at bs=1 there, with aggregate within ~4% of the widest window. Compact verify changes that calculus: with the SPS table pricing verify rows, γ=7 wins bs=1 by +25% over γ=4 at a ~7% conc64 cost (see the 2026-08-07 update), which is why the shipped config now runs 7.
+One caveat you should not skip: synthetic prompts flatter spec decode. Random-token prompts drive the model into highly predictable continuations, which DSPARK predicts almost perfectly — treat the random-dataset decode figures below as optimistic relative to real agentic traffic, where accept length runs lower on reasoning-heavy prose and higher on code/tool output. The bs=1 real-prose numbers above are the honest single-stream figures.
 
 Prefill runs ~5.4K tok/s at 90K ctx and stays roughly flat to large context with the indexer-threshold env set (see the compose file). Without it, prefill decays to ~2K tok/s at large context because every DP prefill chunk falls back to a paged-gather kernel.
 
 ## Concurrency and operating points
 
-Concurrency sweep on this exact image, 1024-in / 512-out unless noted. Random dataset, so the synthetic-prompt caveat applies to the absolute decode numbers; the scaling shape is the point here.
+Concurrency sweep on this exact image and config, 1024-in / 512-out unless noted, `num_prompts = 6×C`, fresh server boot. Random dataset, so the synthetic-prompt caveat above applies to the absolute decode numbers; the scaling shape is the point here.
 
 | C | out tok/s | total tok/s | TTFT mean | TTFT P99 | ITL mean |
 |---|---|---|---|---|---|
-| 1 | 171 | 513 | 200 ms | 228 ms | 5.5 ms |
-| 8 | 767 | 2,300 | 343 ms | 1.0 s | 9.4 ms |
-| 16 | 1,171 | 3,513 | 443 ms | 1.3 s | 12.2 ms |
-| 32 | 1,734 | 5,201 | 448 ms | 1.2 s | 16.9 ms |
-| 64 | 2,467 | 7,401 | 565 ms | 2.2 s | 23.7 ms |
-| 96 | 2,892 | 8,677 | 684 ms | 3.2 s | 30.4 ms |
-| 128 | 3,293 | 9,880 | 777 ms | 3.7 s | 35.6 ms |
-| 192 | 3,370 | 10,110 | 2.03 s | 12.9 s | 51.0 ms |
-| 256 | 3,316 | 9,948 | 4.52 s | 17.1 s | 65.7 ms |
+| 1 | 218 | 653 | 164 ms | 178 ms | 4.3 ms |
+| 8 | 798 | 2,394 | 353 ms | 966 ms | 8.6 ms |
+| 16 | 1,288 | 3,865 | 382 ms | 961 ms | 11.1 ms |
+| 32 | 1,823 | 5,470 | 388 ms | 1.10 s | 15.8 ms |
+| 64 | 2,461 | 7,382 | 566 ms | 2.12 s | 23.8 ms |
+| 96 | 3,196 | 9,587 | 577 ms | 1.79 s | 27.3 ms |
+| 128 | 3,560 | 10,680 | 663 ms | 2.34 s | 32.9 ms |
+| 192 | 3,457 | 10,370 | 1.16 s | 6.64 s | 51.3 ms |
+| 256 | 3,236 | 9,707 | 5.22 s | 24.7 s | 65.4 ms |
 
-The knee is at C≈128: 96→128 still scales (+13.9% throughput), past 128 you buy ≤2.3% more throughput for 2.6–5.8× the TTFT. It's compute-bound, not cap-bound. The TTFT inflection sets in below `--max-running-requests 256`, and at C=256 the cap only just engages (measured running concurrency 246.6), so raising the cap or `--cuda-graph-max-bs` buys zero throughput and only deepens internal queues. We run C=32–64 for interactive agent work (ITL 17–24 ms, TTFT ≤ 0.6 s) and C=128 for max aggregate.
+The knee is sharper than the previous γ=4 config: 96→128 still scales (+11.4% throughput), but past 128 throughput actively *regresses* — 128→192 is −2.9%, 192→256 is −6.4% — while TTFT grows 7.9× and ITL doubles. `--max-running-requests` is still 256, and it only just engages at C=256, so the falloff past 128 isn't the request cap; it's more likely the added dispatch/delayer/compact-verify bookkeeping starting to cost more than it saves once queue depth is very high, though we haven't isolated which piece. **C=32–64 remains the sweet spot for interactive agent work** (ITL 16–24 ms, TTFT ≤0.6 s), and **C=128 for max aggregate** — past 128 you're paying real latency for negative throughput, not just diminishing returns.
 
-Long context moves the knee. At 8192-in / 512-out the regime flips to prefill-bound (aggregate prefill tops out around 9–11K tok/s) and the knee collapses to C ≤ 32: C=32 gives TTFT 4.0 s mean / 18 s P99, C=128 gives 11.1 s mean / 70 s P99. Median ITL holds at 10–18 ms but P95 spikes to 0.3–0.9 s as decode stalls behind prefill chunks (`--chunked-prefill-size 4096` is 1024 per DP rank) — this is the strict prefill-first scheduling tracked upstream in [sglang#32549](https://github.com/sgl-project/sglang/issues/32549); we reproduced it as a global stall under DP attention (a decode victim on a rank with no prefill freezes for the same duration as one sharing a rank with the prefill), not a per-rank contention effect. No fix or knob avoids it today short of bounding concurrency. Practically: keep effective concurrency ≤ 32 for cold large contexts. A cold 50–270K-token context costs tens of seconds of TTFT at the prefill ceiling no matter what; warm sessions fare better via radix-cache prefix hits.
+Long context moves the knee, same as before, but the absolute numbers improved. At 8192-in / 512-out: C=32 gives 545 out tok/s, TTFT 2.90 s mean / 16.1 s P99, ITL 52.6 ms mean; C=128 gives 723 out tok/s, TTFT 4.58 s mean / 33.3 s P99, ITL 167 ms mean — both TTFT figures well under the old γ=4 config's 4.0 s / 18 s and 11.1 s / 70 s at the same concurrency, consistent with the prefill-stack gains in the updates above. The regime is still prefill-bound and decode still stalls behind prefill chunks (`--chunked-prefill-size 4096` is 1024 per DP rank) — this is the strict prefill-first scheduling tracked upstream in [sglang#32549](https://github.com/sgl-project/sglang/issues/32549); we reproduced it as a global stall under DP attention (a decode victim on a rank with no prefill freezes for the same duration as one sharing a rank with the prefill), not a per-rank contention effect. No fix or knob avoids it today short of bounding concurrency. Practically: keep effective concurrency ≤32 for cold large contexts; warm sessions fare better via radix-cache prefix hits.
 
 ## Known issues
 
