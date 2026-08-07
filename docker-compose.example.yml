@@ -171,11 +171,16 @@ services:
       # an x-smg-routing-key header pin to the rendezvous-hashed DP rank,
       # so multi-turn conversations land on the rank that holds their
       # radix-cache prefix (measured: turn-2 prefix hits went from ~25%
-      # under round_robin to 8/8). Unkeyed traffic falls back to plain
-      # round_robin — with no keys these flags behave like stock.
+      # under round_robin to 8/8). Deliberately NOT passing
+      # --prefix-affinity-disable-token-fallback: without an explicit
+      # key (any client that isn't sending one — direct clients, or a
+      # gateway that hasn't wired up header injection), the token-prefix
+      # hash fallback still pins a growing conversation to one rank
+      # instead of round-robining cold across every rank on every turn.
+      # We shipped with that flag once and it turned a multi-hundred-K
+      # conversation into a full cold reprefill almost every turn.
       - --load-balance-method
       - prefix_affinity
-      - --prefix-affinity-disable-token-fallback
       - --prefix-affinity-fallback
       - round_robin
       # Prefill delayer (pr31835 + pr32880 backports make it safe on

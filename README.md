@@ -114,7 +114,6 @@ docker run -d --name sglang \
   --enable-cache-report \
   --default-chat-template-kwargs '{"thinking": true}' \
   --load-balance-method prefix_affinity \
-  --prefix-affinity-disable-token-fallback \
   --prefix-affinity-fallback round_robin \
   --enable-prefill-delayer \
   --prefill-delayer-max-delay-passes 8 \
