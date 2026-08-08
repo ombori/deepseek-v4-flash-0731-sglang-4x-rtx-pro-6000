@@ -1,0 +1,50 @@
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index ae778ee1db..c873f0f4b7 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -7,6 +7,7 @@ import torch
+ 
+ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+ from sglang.srt.environ import envs
++from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
+ from sglang.srt.managers.schedule_batch import ScheduleBatch
+ from sglang.srt.managers.scheduler import GenerationBatchResult
+ from sglang.srt.managers.tp_worker import TpModelWorker
+@@ -364,11 +365,6 @@ class DSparkWorkerV2(BaseSpecWorker):
+         on_publish=None,
+         grammar_barrier=None,
+     ) -> GenerationBatchResult:
+-        if getattr(batch, "return_logprob", False):
+-            raise ValueError(
+-                "DSpark speculative decoding does not support return_logprob yet."
+-            )
+-
+         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+             self._verify_planner.note_non_decode_step()
+             self._observers.note_prefill_step()
+@@ -658,6 +654,25 @@ class DSparkWorkerV2(BaseSpecWorker):
+             )
+         logits_output.hidden_states = None
+ 
++        if batch.return_logprob:
++            # Mirror the DFlash logprob path (#33459): out_tokens[:, j] is
++            # scored by verify-logits row j on both the greedy and sampling
++            # accept paths (chain layout, commit_lens <= verify_lens), so the
++            # accept index is the identity over the strided rows. Rows at or
++            # past commit_lens are never read downstream. Read-only side
++            # output: runs after the fold decision and the accept kernels.
++            stride = int(self.verify_num_draft_tokens)
++            output_indices = torch.arange(
++                bs * stride, dtype=torch.int64, device=device
++            ).view(bs, stride)
++            compute_spec_v2_logprobs(
++                batch,
++                logits_output,
++                accept.out_tokens.reshape(-1),
++                output_indices,
++                stride - 1,
++            )
++
+         self._observers.observe_verify_step(
+             forward_ct=int(batch.forward_iter),
+             reqs=batch.reqs,
